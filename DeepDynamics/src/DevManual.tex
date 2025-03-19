@@ -1,0 +1,498 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{float}
+
+% Define colors for listings
+\definecolor{mygreen}{RGB}{28,172,0}
+\definecolor{mylilas}{RGB}{170,55,241}
+
+\lstset{
+    language=Julia,
+    basicstyle=\ttfamily\footnotesize,
+    numbers=left,
+    numberstyle=\tiny,
+    stepnumber=1,
+    numbersep=5pt,
+    backgroundcolor=\color{white},
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    frame=single,
+    tabsize=2,
+    captionpos=b,
+    breaklines=true,
+    breakatwhitespace=false,
+    keywordstyle=\color{blue},
+    commentstyle=\color{mygreen},
+    stringstyle=\color{mylilas}
+}
+
+\title{DeepDynamics Manual}
+\author{DeepDynamics Framework}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+\newpage
+
+\section{Introduction}
+DeepDynamics is a modular framework for building and training neural networks. This manual covers all the modules of DeepDynamics, including the mathematical theory behind neural networks, detailed explanations of the code (line-by-line), and example usage. In this document, we start with the core module, \textbf{TensorEngine}, and provide placeholders for the remaining modules.
+
+\section{Mathematical Background of Neural Networks}
+\subsection{Forward Propagation}
+In neural networks, the forward propagation computes the output of the network given an input, using operations like matrix multiplication, activation functions, etc.
+
+\subsection{Backpropagation}
+Backpropagation uses the chain rule to compute gradients of the loss function with respect to each parameter in the network. This enables parameter updates via gradient descent or other optimization methods.
+
+\subsection{Loss Functions}
+Loss functions, such as Mean Squared Error (MSE) or cross-entropy, quantify the difference between the predicted outputs and the true labels.
+
+\subsection{Regularization}
+Regularization methods, like L2 regularization, add a penalty term to the loss function to prevent overfitting by discouraging large weights.
+
+\section{Modules of DeepDynamics}
+Below are the primary modules in DeepDynamics:
+\begin{enumerate}[label=\arabic*.]
+  \item \textbf{TensorEngine} -- Core tensor operations, autograd, and basic utilities.
+  \item \textbf{Layers} -- Contains various neural network layers (Dense, Convolutional, etc.).
+  \item \textbf{NeuralNetwork} -- Defines model architectures and sequential containers.
+  \item \textbf{Optimizers} -- Implements optimization algorithms like SGD, Adam, etc.
+  \item \textbf{Training} -- Routines for model training, callbacks, early stopping.
+  \item \textbf{Visualizations} -- Tools for plotting training progress and metrics.
+  \item \textbf{TextUtils} -- Utilities for text processing (vocabulary building, tokenization, padding).
+  \item \textbf{(Others)} -- Additional modules can be included as needed.
+\end{enumerate}
+
+\newpage
+
+\section{TensorEngine Module}
+The \textbf{TensorEngine} module is the core of the DeepDynamics framework. It defines the custom \texttt{Tensor} type and implements fundamental operations and utilities. The following sections provide detailed explanations of each function in this module.
+
+\subsection{Tensor Structure and Constructor}
+\subsubsection*{Code}
+\begin{lstlisting}[language=Julia]
+mutable struct Tensor{N}
+    data::Array{Float64, N}            # Stores the N-dimensional numerical data.
+    grad::Union{Nothing, Tensor{N}}    # Stores the gradient (if computed) with the same dimensions.
+    backward_fn::Union{Nothing, Function}  # Stores the function used for backpropagation.
+end
+
+Tensor(data::Array{Float64, N}) where {N} = Tensor{N}(data, nothing, nothing)
+\end{lstlisting}
+
+\subsubsection*{Explanation}
+\begin{itemize}
+    \item \textbf{Structure Definition:} The \texttt{Tensor} type is defined as a mutable struct parameterized by \texttt{N} (number of dimensions).
+    \begin{itemize}
+        \item \texttt{data} stores the actual numerical data.
+        \item \texttt{grad} holds the gradient, which is another \texttt{Tensor} of the same dimensions or \texttt{nothing} if not computed.
+        \item \texttt{backward\_fn} contains the function used to propagate gradients backward through the computational graph.
+    \end{itemize}
+    \item \textbf{Constructor:} The helper constructor allows you to create a \texttt{Tensor} by providing an array. It automatically sets \texttt{grad} and \texttt{backward\_fn} to \texttt{nothing}.
+\end{itemize}
+
+\subsection{Basic Operations}
+\subsubsection{add Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function add(t1::Tensor{N}, t2::Tensor{N}) where {N}
+    result = Tensor(t1.data .+ t2.data)  # Element-wise addition.
+    result.backward_fn = grad -> begin    # Define backward function.
+        backward(t1, Tensor(grad))        # Propagate gradient to t1.
+        backward(t2, Tensor(grad))        # Propagate gradient to t2.
+    end
+    return result
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item The function \texttt{add} accepts two tensors of the same dimensions.
+    \item It computes the element-wise addition of \texttt{t1.data} and \texttt{t2.data} and wraps the result in a new \texttt{Tensor}.
+    \item The backward function is set to propagate the incoming gradient (without modification, since the derivative of a sum with respect to each operand is 1) to both \texttt{t1} and \texttt{t2}.
+\end{itemize}
+
+\subsubsection{matmul Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function matmul(t1::Tensor{2}, t2::Tensor{2})::Tensor{2}
+    result = Tensor(t1.data * t2.data)  # Matrix multiplication.
+    result.backward_fn = grad -> begin   # Define backward function.
+        backward(t1, Tensor(grad * t2.data'))  # Propagate gradient to t1.
+        backward(t2, Tensor(t1.data' * grad))    # Propagate gradient to t2.
+    end
+    return result
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item This function multiplies two 2D tensors (matrices) using standard matrix multiplication.
+    \item It sets up the backward function to compute the gradients according to the chain rule:
+    \begin{itemize}
+        \item For \texttt{t1}, the gradient is computed as \(\texttt{grad} \times \texttt{t2.data'}\).
+        \item For \texttt{t2}, the gradient is computed as \(\texttt{t1.data'} \times \texttt{grad}\).
+    \end{itemize}
+\end{itemize}
+
+\subsection{Backpropagation Functions}
+\subsubsection{backward Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function backward(t::Tensor, grad::Tensor)
+    if t.grad === nothing
+        t.grad = grad
+    else
+        t.grad.data .+= grad.data
+    end
+    if t.backward_fn !== nothing
+        t.backward_fn(grad.data)
+    end
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item This function updates the gradient of tensor \texttt{t} with the incoming gradient \texttt{grad}.
+    \item If \texttt{t.grad} is \texttt{nothing}, it assigns \texttt{grad} directly; otherwise, it adds \texttt{grad.data} to the existing gradient.
+    \item Finally, if a backward function (\texttt{t.backward\_fn}) is defined, it is called with \texttt{grad.data} to propagate the gradient further.
+\end{itemize}
+
+\subsection{Loss Functions}
+\subsubsection{mse\_loss Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function mse_loss(y_pred::Tensor, y_true::Tensor)::Tensor
+    error = y_pred.data .- y_true.data
+    loss_val = sum(error .^ 2) / max(length(y_pred.data), 1)
+    result = Tensor(reshape([loss_val], (1,1)))
+    result.backward_fn = _ -> begin
+        grad_input = 2 .* error ./ max(length(y_pred.data), 1)
+        backward(y_pred, Tensor(grad_input))
+    end
+    return result
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item Computes the element-wise error between predicted and true values.
+    \item Squares the errors, sums them, and divides by the number of elements to calculate the Mean Squared Error (MSE).
+    \item The scalar loss is reshaped into a 1x1 tensor.
+    \item The backward function calculates the derivative of MSE:
+    \[
+    \frac{\partial \text{MSE}}{\partial y_{\text{pred}}} = \frac{2}{N}(y_{\text{pred}} - y_{\text{true}})
+    \]
+    and propagates this gradient to \texttt{y\_pred}.
+\end{itemize}
+
+\subsubsection{compute\_loss\_with\_regularization Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function compute_loss_with_regularization(output::Tensor, target::Tensor, weights::Vector{Tensor}, λ::Float64)::Tensor
+    mse = mse_loss(output, target)
+    reg_term = isempty(weights) ? Tensor([0.0]) : l2_regularization(weights, λ)
+    total_loss = Tensor(mse.data .+ reg_term.data)
+    return total_loss
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item Computes the MSE loss between the network output and target.
+    \item Checks if the vector \texttt{weights} is empty; if not, computes the L2 regularization term.
+    \item Adds the MSE loss and the regularization term element-wise and wraps the result in a tensor.
+\end{itemize}
+
+\subsection{Initialization Functions}
+\subsubsection{initialize\_grad! Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function initialize_grad!(t::Tensor)
+    t.grad = Tensor(zeros(size(t.data)))
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item Initializes the gradient field of tensor \texttt{t} with an array of zeros matching the shape of \texttt{t.data}.
+\end{itemize}
+
+\subsubsection{initialize\_weights Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function initialize_weights(size::Tuple{Int,Int}; method::Symbol = :xavier)::Tensor
+    fan_in, fan_out = size
+    scale = if method == :he
+        sqrt(2.0 / fan_in)
+    elseif method == :xavier
+        sqrt(1.0 / (fan_in + fan_out))
+    else
+        0.01
+    end
+    return Tensor(scale .* randn(fan_out, fan_in))
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item Unpacks the tuple \texttt{size} into \texttt{fan\_in} (number of inputs) and \texttt{fan\_out} (number of outputs).
+    \item Depending on the \texttt{method} (either \texttt{:he} or \texttt{:xavier}), computes a scaling factor:
+    \begin{itemize}
+        \item For \texttt{:he}: \( \text{scale} = \sqrt{\frac{2}{\text{fan\_in}}} \)
+        \item For \texttt{:xavier}: \( \text{scale} = \sqrt{\frac{1}{\text{fan\_in} + \text{fan\_out}}} \)
+        \item Otherwise, uses 0.01.
+    \end{itemize}
+    \item Generates a random matrix with dimensions \((\text{fan\_out}, \text{fan\_in})\) using \texttt{randn}, scales it by \texttt{scale}, wraps it in a \texttt{Tensor}, and returns it.
+\end{itemize}
+
+\subsection{Regularization}
+\subsubsection{l2\_regularization Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function l2_regularization(weights::Vector{Tensor}, λ::Float64)::Tensor
+    reg = λ * sum(sum(w.data .^ 2) for w in weights)
+    return Tensor([reg])
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item For each tensor \texttt{w} in \texttt{weights}, calculates the sum of squares of its elements.
+    \item Sums these values over all weight tensors and multiplies by the regularization coefficient \( \lambda \).
+    \item Wraps the resulting scalar in a 1x1 tensor and returns it.
+\end{itemize}
+
+\subsection{Gradient Clipping}
+\subsubsection{clip\_gradients! Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function clip_gradients!(t::Tensor, threshold::Float64)
+    if t.grad !== nothing
+        grad_norm = norm(t.grad.data)
+        if grad_norm > threshold
+            scaling_factor = threshold / grad_norm
+            t.grad.data .*= scaling_factor
+        end
+    end
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item Checks if \texttt{t.grad} exists.
+    \item Computes the Euclidean norm of the gradient.
+    \item If the norm exceeds the given threshold, calculates a scaling factor \( \frac{\text{threshold}}{\text{grad\_norm}} \) and scales \texttt{t.grad.data} in place so that its norm is reduced to the threshold.
+\end{itemize}
+
+\subsection{Parameter Update (Optimizers)}
+\subsubsection{step! Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function step!(optimizer, parameters::Vector{Tensor})
+    if optimizer isa SGD
+        for param in parameters
+            if param.grad !== nothing
+                param.data .-= optimizer.learning_rate .* param.grad.data
+            end
+        end
+    elseif optimizer isa Adam
+        optimizer.t += 1
+        for param in parameters
+            if param.grad === nothing
+                continue
+            end
+            if !haskey(optimizer.m, param)
+                optimizer.m[param] = Tensor(zeros(size(param.data)))
+                optimizer.v[param] = Tensor(zeros(size(param.data)))
+            end
+            mt = optimizer.m[param]
+            vt = optimizer.v[param]
+            mt.data .= optimizer.beta1 .* mt.data .+ (1.0 - optimizer.beta1) .* param.grad.data
+            vt.data .= optimizer.beta2 .* vt.data .+ (1.0 - optimizer.beta2) .* (param.grad.data .^ 2)
+            mt_hat = mt.data ./ (1.0 - optimizer.beta1^optimizer.t)
+            vt_hat = vt.data ./ (1.0 - optimizer.beta2^optimizer.t)
+            param.data .-= optimizer.learning_rate .* (mt_hat ./ (sqrt.(vt_hat) .+ optimizer.epsilon))
+        end
+    else
+        error("Optimizer not implemented")
+    end
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\textbf{SGD Branch:}
+\begin{itemize}
+    \item Checks if the optimizer is an instance of SGD.
+    \item Iterates over each parameter and, if a gradient exists, updates the parameter:
+    \[
+    \theta \leftarrow \theta - \eta \cdot \nabla_{\theta}L,
+    \]
+    where \(\eta\) is the learning rate.
+\end{itemize}
+
+\textbf{Adam Branch:}
+\begin{itemize}
+    \item Increments the time step \texttt{optimizer.t} by 1.
+    \item Iterates over each parameter; if no gradient exists, skips the update.
+    \item If the moment estimates (\texttt{m} and \texttt{v}) are not initialized for the parameter, initializes them as zero tensors with the same shape as \texttt{param.data}.
+    \item Updates the first moment estimate:
+    \[
+    m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t,
+    \]
+    where \(g_t\) is the current gradient.
+    \item Updates the second moment estimate:
+    \[
+    v_t = \beta_2 v_{t-1} + (1 - \beta_2) g_t^2.
+    \]
+    \item Computes bias-corrected estimates:
+    \[
+    \hat{m}_t = \frac{m_t}{1 - \beta_1^t}, \quad \hat{v}_t = \frac{v_t}{1 - \beta_2^t}.
+    \]
+    \item Updates the parameter:
+    \[
+    \theta \leftarrow \theta - \eta \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon},
+    \]
+    where \(\epsilon\) is a small constant to avoid division by zero.
+\end{itemize}
+\textbf{Else:}
+\begin{itemize}
+    \item If the optimizer type is not implemented, throws an error.
+\end{itemize}
+
+\subsection{GPU Utilities}
+\subsubsection{to\_gpu Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function to_gpu(t::Tensor)
+    @assert isdefined(Main, :CUDA) "CUDA.jl not available; ensure CUDA is installed."
+    t.data = CUDA.CuArray(t.data)
+    if t.grad !== nothing
+        t.grad.data = CUDA.CuArray(t.grad.data)
+    end
+    return t
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item Ensures CUDA is available using an assertion.
+    \item Converts the tensor data to a CUDA array.
+    \item If the tensor has an associated gradient, converts it as well.
+    \item Returns the modified tensor.
+\end{itemize}
+
+\subsubsection{to\_cpu Function}
+\paragraph{Code}
+\begin{lstlisting}[language=Julia]
+function to_cpu(t::Tensor)
+    t.data = Array(t.data)
+    if t.grad !== nothing
+        t.grad.data = Array(t.grad.data)
+    end
+    return t
+end
+\end{lstlisting}
+
+\paragraph{Explanation}
+\begin{itemize}
+    \item Converts the tensor data back to a standard Julia Array.
+    \item If a gradient exists, converts it back to an Array as well.
+    \item Returns the updated tensor.
+\end{itemize}
+
+---
+
+## 10. Mathematical Background
+
+\subsection*{Mean Squared Error (MSE)}
+The MSE loss is defined as:
+\[
+\text{MSE} = \frac{1}{N} \sum_{i=1}^{N} (y_{\text{pred}, i} - y_{\text{true}, i})^2
+\]
+Its derivative with respect to \( y_{\text{pred}, i} \) is:
+\[
+\frac{\partial \text{MSE}}{\partial y_{\text{pred}, i}} = \frac{2}{N} (y_{\text{pred}, i} - y_{\text{true}, i})
+\]
+
+\subsection*{L2 Regularization}
+L2 regularization penalizes large weights to prevent overfitting:
+\[
+\text{Reg} = \lambda \sum_{w \in \text{weights}} \|w\|^2 = \lambda \sum_{w \in \text{weights}} \sum_{i,j,\ldots} w_{i,j,\ldots}^2
+\]
+
+\subsection*{Weight Initialization}
+\textbf{Xavier (Glorot) Initialization:}
+\[
+\text{scale} = \sqrt{\frac{1}{\text{fan\_in} + \text{fan\_out}}}
+\]
+\textbf{He Initialization:}
+\[
+\text{scale} = \sqrt{\frac{2}{\text{fan\_in}}}
+\]
+
+\subsection*{Adam Optimizer}
+Adam updates parameters based on estimates of the first and second moments of the gradients:
+\begin{align*}
+m_t &= \beta_1 \, m_{t-1} + (1 - \beta_1) \, g_t,\\[1ex]
+v_t &= \beta_2 \, v_{t-1} + (1 - \beta_2) \, g_t^2,
+\end{align*}
+with bias-corrected estimates:
+\[
+\hat{m}_t = \frac{m_t}{1 - \beta_1^t}, \quad \hat{v}_t = \frac{v_t}{1 - \beta_2^t}
+\]
+and the parameter update rule:
+\[
+\theta \leftarrow \theta - \eta \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \epsilon}
+\]
+
+---
+
+## 11. Example Usage
+\begin{lstlisting}[language=Julia]
+# Create two tensors
+t1 = Tensor([1.0, 2.0])
+t2 = Tensor([3.0, 4.0])
+
+# Perform element-wise addition
+result = add(t1, t2)  # Expected result.data: [4.0, 6.0]
+
+# Assume the loss gradient with respect to result is [0.1, 0.1]
+grad = Tensor([0.1, 0.1])
+
+# Propagate the gradient backwards from result
+backward(result, grad)
+
+# After propagation, t1.grad and t2.grad are updated with the gradient [0.1, 0.1] (accumulated).
+\end{lstlisting}
+
+---
+
+## 12. Conclusion
+The \textbf{TensorEngine} module forms the backbone of the DeepDynamics framework by:
+\begin{itemize}
+    \item Defining a custom \texttt{Tensor} type that stores data, gradients, and a backward function.
+    \item Implementing basic operations such as addition and matrix multiplication with proper gradient propagation.
+    \item Providing essential loss functions (e.g., MSE with L2 regularization) for training neural networks.
+    \item Including weight initialization routines using Xavier and He methods.
+    \item Offering gradient clipping and parameter update routines for optimizers (SGD and Adam).
+    \item Facilitating GPU acceleration with utilities to transfer tensors between CPU and GPU.
+\end{itemize}
+
+This modular design enables users to build and train neural networks in a flexible and transparent way, adhering to the chain rule for backpropagation and supporting easy extension of the framework.
+
+\end{document}
