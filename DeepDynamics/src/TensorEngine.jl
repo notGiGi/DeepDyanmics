@@ -2,7 +2,7 @@ module TensorEngine
 
 using ..GPUMemoryManager
 
-export Tensor, add, matmul, backward, step!, mse_loss, initialize_grad!,
+export Tensor, add, matmul, backward, mse_loss, initialize_grad!,
        initialize_weights, l2_regularization, compute_loss_with_regularization,
        clip_gradients!, to_gpu, to_cpu, softmax, zero_grad!
 
@@ -18,10 +18,10 @@ end
 # Ahora es mutable para permitir modificar el campo grad.
 # ---------------------------------------------------------------------------
 mutable struct Tensor{N}
-    data::AbstractArray{Float32, N}    # Datos en Float32
-    grad::Union{Tensor{N}, Nothing}    # Gradiente como otro Tensor o nothing
+    data::AbstractArray{Float32, N}
+    grad::Union{Nothing, Tensor}  # CAMBIO: Quitar {N} para permitir cualquier dimensión
     backward_fn::Union{Function, Nothing}
-    requires_grad::Bool  # NUEVO: campo para tracking de gradientes
+    requires_grad::Bool
 end
 
 # ---------------------------------------------------------------------------
@@ -217,21 +217,21 @@ function matmul(t1::Tensor{2}, t2::Tensor{2})::Tensor{2}
 end
 
 # Reemplaza la función backward en TensorEngine.jl con esta versión
-function backward(t::Tensor, grad::Tensor)
-    # NUEVO: Verificar si requiere gradientes
+function backward(t::Tensor, grad::Union{Tensor, AbstractArray})
+    # Verificar si requiere gradientes
     if !t.requires_grad
         return
     end
     
+    # Convertir grad a datos si es Tensor
+    grad_data = grad isa Tensor ? grad.data : grad
+    
     # Detectar dispositivos
     t_on_gpu = (t.data isa CUDA.CuArray)
-    grad_on_gpu = (grad.data isa CUDA.CuArray)
+    grad_on_gpu = (grad_data isa CUDA.CuArray)
     
     # Obtener tipo de datos
     t_data_type = eltype(t.data)
-    
-    # Asegurar que el gradiente esté en el mismo dispositivo y tipo
-    grad_data = grad.data
     
     # Manejar conversión de dispositivos y tipos
     if t_on_gpu && !grad_on_gpu
@@ -246,9 +246,19 @@ function backward(t::Tensor, grad::Tensor)
         end
     end
     
+    # Verificar dimensiones y expandir si es necesario
+    if size(grad_data) != size(t.data)
+        # Si grad es escalar y t no, expandir grad
+        if length(grad_data) == 1
+            grad_data = fill(grad_data[1], size(t.data))
+        else
+            error("Gradient shape $(size(grad_data)) doesn't match tensor shape $(size(t.data))")
+        end
+    end
+    
     # Actualizar o inicializar el gradiente acumulado
     if t.grad === nothing
-        t.grad = Tensor(grad_data; requires_grad=false)  # NUEVO: grad no necesita grad
+        t.grad = Tensor(copy(grad_data); requires_grad=false)
     else
         # Acumular gradientes
         t.grad.data .+= grad_data
@@ -263,13 +273,17 @@ end
 function mse_loss(y_pred::Tensor, y_true::Tensor)::Tensor
     error = y_pred.data .- y_true.data
     loss_val = sum(error .^ 2) / max(length(y_pred.data), 1)
-    result = Tensor(reshape([loss_val], (1,1)); requires_grad=true)
-    result.backward_fn = _ -> begin
-        if y_pred.requires_grad
-            grad_input = 2 .* error ./ max(length(y_pred.data), 1)
-            backward(y_pred, Tensor(grad_input; requires_grad=false))
-        end
+    
+    # Crear tensor escalar (1D con 1 elemento)
+    result = Tensor([loss_val]; requires_grad=true)
+    
+    result.backward_fn = grad_scalar -> begin
+        # grad_scalar es el gradiente que viene de arriba (escalar)
+        grad_val = grad_scalar isa AbstractArray ? grad_scalar[1] : grad_scalar
+        grad_input = (2.0f0 .* error ./ max(length(y_pred.data), 1)) .* grad_val
+        backward(y_pred, Tensor(grad_input))
     end
+    
     return result
 end
 
@@ -318,38 +332,7 @@ function clip_gradients!(t::Tensor, threshold::Float64)
     end
 end
 
-# ---------------------------------------------------------------------------
-# Paso de actualización (optimización)
-# ---------------------------------------------------------------------------
-function step!(optimizer, parameters::Vector{Tensor})
-    if optimizer isa SGD
-        for param in parameters
-            if param.grad !== nothing && param.requires_grad
-                @inbounds param.data .-= optimizer.learning_rate .* param.grad.data
-            end
-        end
-    elseif optimizer isa Adam
-        optimizer.t += 1
-        for param in parameters
-            if param.grad === nothing || !param.requires_grad
-                continue
-            end
-            if !haskey(optimizer.m, param)
-                optimizer.m[param] = Tensor(zeros(Float32, size(param.data)); requires_grad=false)
-                optimizer.v[param] = Tensor(zeros(Float32, size(param.data)); requires_grad=false)
-            end
-            mt = optimizer.m[param]
-            vt = optimizer.v[param]
-            @inbounds mt.data .= optimizer.beta1 .* mt.data .+ (1.0 - optimizer.beta1) .* param.grad.data
-            @inbounds vt.data .= optimizer.beta2 .* vt.data .+ (1.0 - optimizer.beta2) .* (param.grad.data .^ 2)
-            mt_hat = mt.data ./ (1.0 - optimizer.beta1^optimizer.t)
-            vt_hat = vt.data ./ (1.0 - optimizer.beta2^optimizer.t)
-            @inbounds param.data .-= optimizer.learning_rate .* (mt_hat ./ (sqrt.(vt_hat) .+ optimizer.epsilon))
-        end
-    else
-        error("Optimizer not implemented")
-    end
-end
+
 
 # ---------------------------------------------------------------------------
 # Función Softmax

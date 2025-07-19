@@ -31,10 +31,10 @@ include("Models.jl")
 
 #include("ProfilingTools.jl")
 # Importar y reexportar símbolos clave:
-using .TensorEngine: Tensor, backward, step!, mse_loss, 
+using .TensorEngine: Tensor, backward, mse_loss, 
        initialize_grad!, initialize_weights, l2_regularization,
        compute_loss_with_regularization, clip_gradients!, 
-       to_gpu, to_cpu, softmax
+       to_gpu, to_cpu, softmax, zero_grad!, add
 using .AbstractLayer: Layer
 using .Visualizations
 using .ReshapeModule: Reshape
@@ -77,7 +77,7 @@ export Tensor,
        UNet, load_vgg16, stack_batch, Activation, optim_step!, ConvKernelLayer, apply_augmentation, 
        augment_batch, StepScheduler, CosineAnnealingScheduler, get_lr, train_improved!, DropoutLayer,
        create_resnet, create_simple_cnn, LayerActivation, apply_augmentation, augment_batch,
-       get_tensor_buffer, release_tensor_buffer, clear_cache, DataLoader, optimized_data_loader
+       get_tensor_buffer, release_tensor_buffer, clear_cache, DataLoader, optimized_data_loader, zero_grad!, add, backward, mse_loss
 
 # Funciones para mover modelos a GPU/CPU
 function model_to_gpu(model::NeuralNetwork.Sequential)
