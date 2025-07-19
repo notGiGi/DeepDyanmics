@@ -2,9 +2,9 @@ module TensorEngine
 
 using ..GPUMemoryManager
 
-export Tensor, add, matmul, backward, step!, mse_loss, initialize_grad!,
+export Tensor, add, matmul, backward, mse_loss, initialize_grad!,
        initialize_weights, l2_regularization, compute_loss_with_regularization,
-       clip_gradients!, to_gpu, to_cpu, softmax
+       clip_gradients!, to_gpu, to_cpu, softmax, zero_grad!
 
 using Random, Statistics, LinearAlgebra
 try
@@ -18,9 +18,10 @@ end
 # Ahora es mutable para permitir modificar el campo grad.
 # ---------------------------------------------------------------------------
 mutable struct Tensor{N}
-    data::AbstractArray{Float32, N}    # Datos en Float32
-    grad::Union{Tensor{N}, Nothing}    # Gradiente como otro Tensor o nothing
+    data::AbstractArray{Float32, N}
+    grad::Union{Nothing, Tensor}  # CAMBIO: Quitar {N} para permitir cualquier dimensión
     backward_fn::Union{Function, Nothing}
+    requires_grad::Bool
 end
 
 # ---------------------------------------------------------------------------
@@ -30,11 +31,13 @@ end
 Tensor(x::Tensor) = x
 
 # Constructor para arrays que ya son Array{Float32, N}.
-Tensor(data::AbstractArray{Float32, N}) where {N} = Tensor{N}(data, nothing, nothing)
+function Tensor(data::AbstractArray{Float32, N}; requires_grad=true) where {N}
+    return Tensor{N}(data, nothing, nothing, requires_grad)
+end
 
 # Constructor para arrays de otro tipo (se convierten a Float32).
-function Tensor(data::AbstractArray{T, N}) where {T<:Real, N}
-    return Tensor{N}(Float32.(data), nothing, nothing)
+function Tensor(data::AbstractArray{T, N}; requires_grad=true) where {T<:Real, N}
+    return Tensor{N}(Float32.(data), nothing, nothing, requires_grad)
 end
 
 # ---------------------------------------------------------------------------
@@ -42,6 +45,20 @@ end
 # ---------------------------------------------------------------------------
 Base.size(t::Tensor) = size(t.data)
 Base.ndims(t::Tensor) = ndims(t.data)
+
+# ---------------------------------------------------------------------------
+# Función zero_grad!
+# ---------------------------------------------------------------------------
+"""
+    zero_grad!(t::Tensor)
+
+Reinicia los gradientes del tensor a cero. Esencial para evitar acumulación entre batches.
+"""
+function zero_grad!(t::Tensor)
+    if t.grad !== nothing && t.grad.data !== nothing
+        fill!(t.grad.data, 0f0)
+    end
+end
 
 # ---------------------------------------------------------------------------
 # Operaciones: add, matmul, backward, mse_loss, initialize_grad!, etc.
@@ -110,7 +127,7 @@ function ensure_on_device(t::Tensor, device::Symbol)
     end
     
     new_data = ensure_on_device(t.data, device)
-    result = Tensor(new_data)
+    result = Tensor(new_data; requires_grad=t.requires_grad)
     
     if t.grad !== nothing
         result.grad = ensure_on_device(t.grad, device)
@@ -144,12 +161,16 @@ function add(t1::Tensor{N}, t2::Tensor{N}) where {N}
     
     # Realizar la operación
     result_data = t1_data .+ t2_data
-    result = Tensor(result_data)
+    result = Tensor(result_data; requires_grad=(t1.requires_grad || t2.requires_grad))
     
     # Definir backward
     result.backward_fn = grad -> begin
-        backward(t1, Tensor(ensure_compatible(grad, t1.data)))
-        backward(t2, Tensor(ensure_compatible(grad, t2.data)))
+        if t1.requires_grad
+            backward(t1, Tensor(ensure_compatible(grad, t1.data); requires_grad=false))
+        end
+        if t2.requires_grad
+            backward(t2, Tensor(ensure_compatible(grad, t2.data); requires_grad=false))
+        end
     end
     
     return result
@@ -177,45 +198,47 @@ function matmul(t1::Tensor{2}, t2::Tensor{2})::Tensor{2}
     
     # Realizar la multiplicación
     result_data = t1_data * t2_data
-    result = Tensor(result_data)
+    result = Tensor(result_data; requires_grad=(t1.requires_grad || t2.requires_grad))
     
     # Definir backward
     result.backward_fn = grad -> begin
         grad_compatible = ensure_compatible(grad, reference)
-        t1_grad = grad_compatible * t2_data'
-        t2_grad = t1_data' * grad_compatible
-        
-        backward(t1, Tensor(ensure_compatible(t1_grad, t1.data)))
-        backward(t2, Tensor(ensure_compatible(t2_grad, t2.data)))
+        if t1.requires_grad
+            t1_grad = grad_compatible * t2_data'
+            backward(t1, Tensor(ensure_compatible(t1_grad, t1.data); requires_grad=false))
+        end
+        if t2.requires_grad
+            t2_grad = t1_data' * grad_compatible
+            backward(t2, Tensor(ensure_compatible(t2_grad, t2.data); requires_grad=false))
+        end
     end
     
     return result
 end
 
 # Reemplaza la función backward en TensorEngine.jl con esta versión
-
-function backward(t::Tensor, grad::Tensor)
-    # Detectar si el tensor t está en GPU
+function backward(t::Tensor, grad::Union{Tensor, AbstractArray})
+    # Verificar si requiere gradientes
+    if !t.requires_grad
+        return
+    end
+    
+    # Convertir grad a datos si es Tensor
+    grad_data = grad isa Tensor ? grad.data : grad
+    
+    # Detectar dispositivos
     t_on_gpu = (t.data isa CUDA.CuArray)
+    grad_on_gpu = (grad_data isa CUDA.CuArray)
     
-    # Detectar si el gradiente está en GPU
-    grad_on_gpu = (grad.data isa CUDA.CuArray)
-    
-    # Obtener el tipo de datos del tensor t
+    # Obtener tipo de datos
     t_data_type = eltype(t.data)
     
-    # Asegurarnos de que el gradiente esté en el mismo dispositivo y tipo que t
-    grad_data = grad.data
-    
-    # Manejar la conversión de dispositivos y tipos
+    # Manejar conversión de dispositivos y tipos
     if t_on_gpu && !grad_on_gpu
-        # Si t está en GPU pero grad no, convertir grad a GPU y al tipo correcto
         grad_data = CUDA.CuArray{t_data_type}(convert.(t_data_type, grad_data))
     elseif !t_on_gpu && grad_on_gpu
-        # Si t está en CPU pero grad no, convertir grad a CPU y al tipo correcto
         grad_data = Array{t_data_type}(convert.(t_data_type, Array(grad_data)))
     elseif eltype(grad_data) != t_data_type
-        # Si ya están en el mismo dispositivo pero con tipos diferentes
         if t_on_gpu
             grad_data = CUDA.CuArray{t_data_type}(convert.(t_data_type, Array(grad_data)))
         else
@@ -223,34 +246,21 @@ function backward(t::Tensor, grad::Tensor)
         end
     end
     
+    # Verificar dimensiones y expandir si es necesario
+    if size(grad_data) != size(t.data)
+        # Si grad es escalar y t no, expandir grad
+        if length(grad_data) == 1
+            grad_data = fill(grad_data[1], size(t.data))
+        else
+            error("Gradient shape $(size(grad_data)) doesn't match tensor shape $(size(t.data))")
+        end
+    end
+    
     # Actualizar o inicializar el gradiente acumulado
     if t.grad === nothing
-        # Si el gradiente es nil, inicializarlo
-        t.grad = Tensor(grad_data)
+        t.grad = Tensor(copy(grad_data); requires_grad=false)
     else
-        # Asegurarnos de que t.grad está en el mismo dispositivo que grad_data
-        t_grad_on_gpu = (t.grad.data isa CUDA.CuArray)
-        t_grad_type = eltype(t.grad.data)
-        
-        # Manejar diferencias de dispositivo
-        if t_grad_on_gpu != (grad_data isa CUDA.CuArray)
-            if grad_data isa CUDA.CuArray
-                t.grad.data = CUDA.CuArray{t_grad_type}(convert.(t_grad_type, Array(t.grad.data)))
-            else
-                t.grad.data = convert.(t_grad_type, Array(t.grad.data))
-            end
-        end
-        
-        # Manejar diferencias de tipo
-        if eltype(t.grad.data) != eltype(grad_data)
-            if t_grad_on_gpu
-                t.grad.data = CUDA.CuArray{t_grad_type}(convert.(t_grad_type, Array(grad_data)))
-            else
-                grad_data = convert.(t_grad_type, grad_data)
-            end
-        end
-        
-        # Acumular el gradiente
+        # Acumular gradientes
         t.grad.data .+= grad_data
     end
     
@@ -263,17 +273,24 @@ end
 function mse_loss(y_pred::Tensor, y_true::Tensor)::Tensor
     error = y_pred.data .- y_true.data
     loss_val = sum(error .^ 2) / max(length(y_pred.data), 1)
-    result = Tensor(reshape([loss_val], (1,1)))
-    result.backward_fn = _ -> begin
-        grad_input = 2 .* error ./ max(length(y_pred.data), 1)
+    
+    # Crear tensor escalar (1D con 1 elemento)
+    result = Tensor([loss_val]; requires_grad=true)
+    
+    result.backward_fn = grad_scalar -> begin
+        # grad_scalar es el gradiente que viene de arriba (escalar)
+        grad_val = grad_scalar isa AbstractArray ? grad_scalar[1] : grad_scalar
+        grad_input = (2.0f0 .* error ./ max(length(y_pred.data), 1)) .* grad_val
         backward(y_pred, Tensor(grad_input))
     end
+    
     return result
 end
 
 function initialize_grad!(t::Tensor)
-    # Crea un Tensor de ceros del mismo tamaño que t.data y lo asigna a t.grad.
-    t.grad = Tensor(zeros(Float32, size(t.data)))
+    if t.requires_grad && t.grad === nothing
+        t.grad = Tensor(zeros(Float32, size(t.data)); requires_grad=false)
+    end
 end
 
 # ---------------------------------------------------------------------------
@@ -290,18 +307,18 @@ function initialize_weights(size::Tuple{Int,Int}; method::Symbol = :xavier)::Ten
             0.01f0
         end
     )
-    return Tensor(scale .* randn(Float32, fan_out, fan_in))
+    return Tensor(scale .* randn(Float32, fan_out, fan_in); requires_grad=true)
 end
 
 function l2_regularization(weights::Vector{Tensor}, λ::Float64)::Tensor
     reg = λ * sum(sum(w.data .^ 2) for w in weights)
-    return Tensor([reg])
+    return Tensor([reg]; requires_grad=false)
 end
 
 function compute_loss_with_regularization(output::Tensor, target::Tensor, weights::Vector{Tensor}, λ::Float64)::Tensor
     mse = mse_loss(output, target)
-    reg_term = isempty(weights) ? Tensor([0.0]) : l2_regularization(weights, λ)
-    total_loss = Tensor(mse.data .+ reg_term.data)
+    reg_term = isempty(weights) ? Tensor([0.0]; requires_grad=false) : l2_regularization(weights, λ)
+    total_loss = Tensor(mse.data .+ reg_term.data; requires_grad=true)
     return total_loss
 end
 
@@ -315,38 +332,7 @@ function clip_gradients!(t::Tensor, threshold::Float64)
     end
 end
 
-# ---------------------------------------------------------------------------
-# Paso de actualización (optimización)
-# ---------------------------------------------------------------------------
-function step!(optimizer, parameters::Vector{Tensor})
-    if optimizer isa SGD
-        for param in parameters
-            if param.grad !== nothing
-                @inbounds param.data .-= optimizer.learning_rate .* param.grad.data
-            end
-        end
-    elseif optimizer isa Adam
-        optimizer.t += 1
-        for param in parameters
-            if param.grad === nothing
-                continue
-            end
-            if !haskey(optimizer.m, param)
-                optimizer.m[param] = Tensor(zeros(Float32, size(param.data)))
-                optimizer.v[param] = Tensor(zeros(Float32, size(param.data)))
-            end
-            mt = optimizer.m[param]
-            vt = optimizer.v[param]
-            @inbounds mt.data .= optimizer.beta1 .* mt.data .+ (1.0 - optimizer.beta1) .* param.grad.data
-            @inbounds vt.data .= optimizer.beta2 .* vt.data .+ (1.0 - optimizer.beta2) .* (param.grad.data .^ 2)
-            mt_hat = mt.data ./ (1.0 - optimizer.beta1^optimizer.t)
-            vt_hat = vt.data ./ (1.0 - optimizer.beta2^optimizer.t)
-            @inbounds param.data .-= optimizer.learning_rate .* (mt_hat ./ (sqrt.(vt_hat) .+ optimizer.epsilon))
-        end
-    else
-        error("Optimizer not implemented")
-    end
-end
+
 
 # ---------------------------------------------------------------------------
 # Función Softmax
@@ -355,7 +341,7 @@ function softmax(x::Tensor)::Tensor
     exps = exp.(x.data .- maximum(x.data))
     sum_exps = sum(exps)
     probs = exps ./ sum_exps
-    return Tensor(probs)
+    return Tensor(probs; requires_grad=x.requires_grad)
 end
 
 # ---------------------------------------------------------------------------
@@ -413,7 +399,7 @@ end
 # Versión optimizada para crear tensores en GPU
 function tensor_gpu(shape, type=Float32)
     buffer = GPUMemoryManager.get_tensor_buffer(shape, type)
-    return Tensor(buffer)
+    return Tensor(buffer; requires_grad=true)
 end
 
 # Liberar tensor GPU cuando ya no es necesario
@@ -425,5 +411,3 @@ end
 
 
 end  # module TensorEngine
-
-
