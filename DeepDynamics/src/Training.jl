@@ -293,9 +293,9 @@ function train_batch!(model::NeuralNetwork.Sequential, optimizer, loss_fn::Funct
             bend = min(bstart+batch_size-1, num_samples)
             batch_idxs = idxs[bstart:bend]
             
-            # Reinicializa grad
+            # CAMBIO FASE 1: Usar zero_grad! en lugar de initialize_grad!
             for p in params
-                TensorEngine.initialize_grad!(p)
+                TensorEngine.zero_grad!(p)
             end
 
             # Procesar batch
@@ -406,6 +406,13 @@ function train_with_loaders(model, optimizer, loss_fn, train_loader, val_loader,
     
     params = NeuralNetwork.collect_parameters(model)
     
+    # Variables para early stopping
+    best_val_loss = Inf
+    wait_epochs = 0
+    patience = 10
+    min_delta = 0.0001
+    best_weights = nothing
+    
     for epoch in 1:epochs
         println("Epoch $epoch/$epochs:")
         epoch_start = time()
@@ -415,9 +422,9 @@ function train_with_loaders(model, optimizer, loss_fn, train_loader, val_loader,
         num_batches = 0
         
         for (batch_x, batch_y) in train_loader
-            # Reiniciar gradientes
+            # CAMBIO FASE 1: Usar zero_grad!
             for param in params
-                TensorEngine.initialize_grad!(param)
+                TensorEngine.zero_grad!(param)
             end
             
             # Forward pass
@@ -649,9 +656,9 @@ function train_improved!(
                 batch_x = stack_batch(batch_tensors)
                 batch_y = stack_batch(batch_labels)
                 
-                # Reiniciar gradientes
+                # CAMBIO FASE 1: Usar zero_grad!
                 for param in params
-                    TensorEngine.initialize_grad!(param)
+                    TensorEngine.zero_grad!(param)
                 end
                 
                 # Forward pass
@@ -893,6 +900,7 @@ function compute_accuracy_batched(model, inputs, targets; batch_size=32)
     
     return total > 0 ? correct / total : 0.0
 end
+
 """
     train_improved_gpu!(model, optimizer, loss_fn, train_data, train_labels, epochs; kwargs...)
 
@@ -968,9 +976,9 @@ function train_improved_gpu!(
         num_batches = 0
         
         for (batch_x, batch_y) in train_loader
-            # Reiniciar gradientes
+            # CAMBIO FASE 1: Usar zero_grad!
             for param in params
-                TensorEngine.initialize_grad!(param)
+                TensorEngine.zero_grad!(param)
             end
             
             # Forward pass
@@ -1079,8 +1087,5 @@ function adapt_image(img::TensorEngine.Tensor)
     end
     return TensorEngine.Tensor(data_reshaped)
 end
-
-
-
 
 end # module Training
