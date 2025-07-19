@@ -35,7 +35,7 @@ using .TensorEngine: Tensor, backward, mse_loss,
        initialize_grad!, initialize_weights, l2_regularization,
        compute_loss_with_regularization, clip_gradients!, 
        to_gpu, to_cpu, softmax, zero_grad!, add
-using .AbstractLayer: Layer
+using .AbstractLayer: Layer3
 using .Visualizations
 using .ReshapeModule: Reshape
 using .Losses: binary_crossentropy, categorical_crossentropy
@@ -48,7 +48,7 @@ using .Optimizers: SGD, Adam, RMSProp, Adagrad, Nadam
 using .Optimizers: step! as optim_step!  # Renombrar para evitar conflicto
 using .Metrics: accuracy, mae, rmse, f1_score, precision, recall, binary_accuracy
 using .Reports
-using .Training: train_batch!, train_improved!,  train!, EarlyStopping, Callback, PrintCallback, FinalReportCallback, add_callback!, run_epoch_callbacks, run_final_callbacks
+using .Training: train_batch!, stack_batch, train_improved!,  train!, EarlyStopping, Callback, PrintCallback, FinalReportCallback, add_callback!, run_epoch_callbacks, run_final_callbacks
 using .Utils: normalize_inputs
 using .TextUtils: build_vocabulary, text_to_indices, pad_sequence
 using .ImageProcessing: load_image, load_images_from_folder, augment_image, prepare_batch

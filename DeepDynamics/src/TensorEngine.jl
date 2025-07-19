@@ -216,6 +216,110 @@ function matmul(t1::Tensor{2}, t2::Tensor{2})::Tensor{2}
     return result
 end
 
+# Agregar estas funciones a TensorEngine.jl después de la función add
+
+# Multiplicación escalar
+function Base.:*(scalar::Number, t::Tensor)
+    result_data = scalar .* t.data
+    result = Tensor(result_data; requires_grad=t.requires_grad)
+    
+    if t.requires_grad
+        result.backward_fn = grad -> begin
+            grad_data = grad isa Tensor ? grad.data : grad
+            backward(t, Tensor(scalar .* grad_data; requires_grad=false))
+        end
+    end
+    
+    return result
+end
+
+function Base.:*(t::Tensor, scalar::Number)
+    return scalar * t
+end
+
+# Suma escalar
+function Base.:+(t::Tensor, scalar::Number)
+    result_data = t.data .+ scalar
+    result = Tensor(result_data; requires_grad=t.requires_grad)
+    
+    if t.requires_grad
+        result.backward_fn = grad -> begin
+            grad_data = grad isa Tensor ? grad.data : grad
+            backward(t, Tensor(grad_data; requires_grad=false))
+        end
+    end
+    
+    return result
+end
+
+function Base.:+(scalar::Number, t::Tensor)
+    return t + scalar
+end
+
+# Resta
+function Base.:-(t1::Tensor{N}, t2::Tensor{N}) where {N}
+    result_data = t1.data .- t2.data
+    result = Tensor(result_data; requires_grad=(t1.requires_grad || t2.requires_grad))
+    
+    result.backward_fn = grad -> begin
+        grad_data = grad isa Tensor ? grad.data : grad
+        if t1.requires_grad
+            backward(t1, Tensor(grad_data; requires_grad=false))
+        end
+        if t2.requires_grad
+            backward(t2, Tensor(-grad_data; requires_grad=false))
+        end
+    end
+    
+    return result
+end
+
+# División
+function Base.:/(t::Tensor, scalar::Number)
+    return (1.0f0 / scalar) * t
+end
+
+# Para soportar broadcasting con .* .+ etc
+Base.broadcastable(t::Tensor) = t
+Base.axes(t::Tensor) = axes(t.data)
+Base.ndims(::Type{<:Tensor{N}}) where {N} = N
+Base.eltype(t::Tensor) = eltype(t.data)
+Base.similar(t::Tensor, ::Type{T}, dims::Dims) where {T} = Tensor(similar(t.data, T, dims))
+
+# Implementar interfaz de broadcasting
+struct TensorStyle <: Base.Broadcast.BroadcastStyle end
+Base.BroadcastStyle(::Type{<:Tensor}) = TensorStyle()
+
+# Cuando se mezclan Tensor y Array/Number
+Base.BroadcastStyle(::TensorStyle, ::Base.Broadcast.DefaultArrayStyle) = TensorStyle()
+Base.BroadcastStyle(::TensorStyle, ::Base.Broadcast.Style{Tuple}) = TensorStyle()
+
+# Materializar el broadcast
+function Base.Broadcast.broadcasted(::TensorStyle, op, args...)
+    # Extraer datos de los Tensores
+    data_args = map(args) do arg
+        arg isa Tensor ? arg.data : arg
+    end
+    
+    # Aplicar la operación
+    result_data = Base.Broadcast.broadcasted(op, data_args...)
+    
+    # Si es una operación simple, materializarla
+    if op in (+, -, *, /)
+        result_data = Base.Broadcast.materialize(result_data)
+        # Determinar si requiere gradientes
+        requires_grad = any(arg isa Tensor && arg.requires_grad for arg in args)
+        return Tensor(result_data; requires_grad=requires_grad)
+    else
+        # Para operaciones más complejas, devolver el objeto broadcasted
+        return result_data
+    end
+end
+
+# Para que funcione el broadcast assignment
+Base.copyto!(dest::Tensor, src::Tensor) = (copyto!(dest.data, src.data); dest)
+Base.copyto!(dest::Tensor, src) = (copyto!(dest.data, src); dest)
+
 # Reemplaza la función backward en TensorEngine.jl con esta versión
 function backward(t::Tensor, grad::Union{Tensor, AbstractArray})
     # Verificar si requiere gradientes

@@ -164,13 +164,13 @@ end
 struct Flatten <: AbstractLayer.Layer end
 
 function (layer::Flatten)(input::TensorEngine.Tensor)
-    # Añadir depuración
-    #println("Flatten - Input shape: ", size(input.data))
-    
     dims = size(input.data)
     @assert length(dims) >= 2 "El tensor de entrada debe tener al menos 2 dimensiones."
     
     is_on_gpu = (input.data isa CUDA.CuArray)
+    
+    # Detección mejorada de formato basada en patrones comunes
+    format = detect_format(dims)
     
     # Caso específico para salida de GlobalAvgPool (batch, channels, 1, 1)
     if length(dims) == 4 && dims[3] == 1 && dims[4] == 1
@@ -178,19 +178,14 @@ function (layer::Flatten)(input::TensorEngine.Tensor)
         channels = dims[2]
         
         if is_on_gpu
-            # En GPU, usar funciones específicas de CUDA
             reshaped = CUDA.reshape(input.data, (batch_size, channels))
             new_data = CUDA.permutedims(reshaped, (2, 1))  # (channels, batch)
         else
-            # En CPU
             reshaped = reshape(input.data, (batch_size, channels))
             new_data = permutedims(reshaped, (2, 1))  # (channels, batch)
         end
     else
-        # Detectar el formato NCHW vs WHCN para otros casos
-        is_nchw = (length(dims) == 4 && dims[1] <= 64)
-        
-        if is_nchw
+        if format == :NCHW
             # Formato NCHW: (batch, canales, alto, ancho)
             n = dims[1]
             flat_dim = prod(dims[2:end])
@@ -203,7 +198,7 @@ function (layer::Flatten)(input::TensorEngine.Tensor)
                 reshaped = reshape(input.data, (n, flat_dim))
                 new_data = permutedims(reshaped, (2, 1))
             end
-        else
+        else  # format == :WHCN
             # Formato WHCN (original): (W, H, C, N)
             flat_dim = prod(dims[1:end-1])
             batch_dim = dims[end]
@@ -217,15 +212,13 @@ function (layer::Flatten)(input::TensorEngine.Tensor)
         end
     end
     
-    #println("Flatten - Output shape: ", size(new_data))
     out = TensorEngine.Tensor(new_data)
     
-    # Nueva implementación segura para backward
+    # Implementación mejorada de backward
     out.backward_fn = grad -> begin
-        # Obtener datos del gradiente
         grad_data = grad
         
-        # Convertir a mismo tipo y dispositivo que input
+        # Asegurar mismo dispositivo que input
         if (grad_data isa CUDA.CuArray) != is_on_gpu
             if is_on_gpu
                 grad_data = CUDA.CuArray(grad_data)
@@ -234,35 +227,31 @@ function (layer::Flatten)(input::TensorEngine.Tensor)
             end
         end
         
-        # Caso especial para salida de GlobalAvgPool
+        # Restaurar forma original según el caso
         if length(dims) == 4 && dims[3] == 1 && dims[4] == 1
             batch_size = dims[1]
             channels = dims[2]
             
             if is_on_gpu
-                grad_reshaped = CUDA.permutedims(grad_data, (2, 1))  # (batch, channels)
+                grad_reshaped = CUDA.permutedims(grad_data, (2, 1))
                 restored = CUDA.reshape(grad_reshaped, (batch_size, channels, 1, 1))
             else
-                grad_reshaped = permutedims(grad_data, (2, 1))  # (batch, channels)
+                grad_reshaped = permutedims(grad_data, (2, 1))
                 restored = reshape(grad_reshaped, (batch_size, channels, 1, 1))
             end
-        elseif is_nchw
-            # Para formato NCHW, necesitamos deshacer las operaciones
+        elseif format == :NCHW
             if is_on_gpu
-                # En GPU, manejar con cuidado
-                grad_reshaped = CUDA.permutedims(grad_data, (2, 1))  # (n, flat_dim)
-                restored = CUDA.reshape(grad_reshaped, dims)  # Restaurar a forma original
+                grad_reshaped = CUDA.permutedims(grad_data, (2, 1))
+                restored = CUDA.reshape(grad_reshaped, dims)
             else
-                # En CPU
-                grad_reshaped = permutedims(grad_data, (2, 1))  # (n, flat_dim)
-                restored = reshape(grad_reshaped, dims)  # Restaurar a forma original
+                grad_reshaped = permutedims(grad_data, (2, 1))
+                restored = reshape(grad_reshaped, dims)
             end
-        else
-            # Para formato WHCN (original)
+        else  # format == :WHCN
             if is_on_gpu
-                restored = CUDA.reshape(grad_data, dims)  # Restaurar a forma original
+                restored = CUDA.reshape(grad_data, dims)
             else
-                restored = reshape(grad_data, dims)  # Restaurar a forma original
+                restored = reshape(grad_data, dims)
             end
         end
         
@@ -270,6 +259,28 @@ function (layer::Flatten)(input::TensorEngine.Tensor)
     end
     
     return out
+end
+
+# Función auxiliar para detectar formato
+function detect_format(dims::Tuple)
+    if length(dims) != 4
+        return :UNKNOWN
+    end
+    
+    # Heurísticas para detectar formato:
+    # NCHW: batch suele ser pequeño (1-256), canales moderados (3-2048)
+    # WHCN: batch al final, dimensiones espaciales primero
+    
+    # Si la primera dimensión es pequeña y la segunda parece canales
+    if dims[1] <= 256 && dims[2] in [1, 3, 16, 32, 64, 128, 256, 512, 1024, 2048]
+        return :NCHW
+    # Si las primeras dos dimensiones son grandes (espaciales) y la última es pequeña (batch)
+    elseif dims[1] > 10 && dims[2] > 10 && dims[4] <= 256
+        return :WHCN
+    else
+        # Default a NCHW si no está claro
+        return :NCHW
+    end
 end
 
 # ==================================================================

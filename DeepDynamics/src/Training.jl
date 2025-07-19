@@ -12,7 +12,7 @@ using CUDA
 import ..Optimizers: step!
 export train!, train_batch!, compute_accuracy_general, train_improved!,
        EarlyStopping, Callback, PrintCallback, FinalReportCallback, add_callback!, 
-       run_epoch_callbacks, run_final_callbacks, train_with_loaders, evaluate_model
+       run_epoch_callbacks, run_final_callbacks, train_with_loaders, stack_batch, evaluate_model
 
 # -----------------------------------------------------------------------
 # Estructuras de EarlyStopping, Callbacks, etc.
@@ -86,62 +86,118 @@ end
 # -----------------------------------------------------------------------
 # Función de stacking optimizada para GPU
 # -----------------------------------------------------------------------
+# Mejora para stack_batch en Training.jl
+# Reemplazar la función stack_batch existente con esta versión mejorada
+
 function stack_batch(batch::Vector{<:TensorEngine.Tensor})
-    isempty(batch) && return TensorEngine.Tensor(CUDA.zeros(Float32, 0))
+    isempty(batch) && return TensorEngine.Tensor(zeros(Float32, 0))
     
-    nd = TensorEngine.ndims(batch[1])
-    is_on_gpu = batch[1].data isa CUDA.CuArray
+    # Detectar dispositivo del primer tensor
+    first_tensor = batch[1]
+    target_device = first_tensor.data isa CUDA.CuArray ? :gpu : :cpu
+    
+    # Verificar que todos los tensores estén en el mismo dispositivo
+    # Si no, moverlos al dispositivo del primer tensor
+    consistent_batch = Vector{TensorEngine.Tensor}(undef, length(batch))
+    for (i, tensor) in enumerate(batch)
+        current_device = tensor.data isa CUDA.CuArray ? :gpu : :cpu
+        if current_device != target_device
+            if target_device == :gpu
+                # Mover a GPU
+                new_data = CUDA.CuArray(tensor.data)
+                consistent_batch[i] = TensorEngine.Tensor(new_data; requires_grad=tensor.requires_grad)
+            else
+                # Mover a CPU
+                new_data = Array(tensor.data)
+                consistent_batch[i] = TensorEngine.Tensor(new_data; requires_grad=tensor.requires_grad)
+            end
+        else
+            consistent_batch[i] = tensor
+        end
+    end
+    
+    # Ahora procesar según dimensiones
+    nd = TensorEngine.ndims(first_tensor)
+    is_on_gpu = (target_device == :gpu)
     
     if nd == 3  # Tensores 3D (C, H, W)
-        # Concatenar en la dimensión 4 (N) y reordenar a (N, C, H, W)
         if is_on_gpu
-            # Obtener un buffer GPU optimizado para el resultado
-            c, h, w = size(batch[1].data)
-            n = length(batch)
+            # Versión optimizada para GPU
+            c, h, w = size(first_tensor.data)
+            n = length(consistent_batch)
             
             # Usar GPUMemoryManager para obtener buffer eficiente
-            result_buffer = GPUMemoryManager.get_tensor_buffer((n, c, h, w), eltype(batch[1].data))
+            result_buffer = GPUMemoryManager.get_tensor_buffer((n, c, h, w), Float32)
             
             # Copiar datos
-            for (i, tensor) in enumerate(batch)
+            for (i, tensor) in enumerate(consistent_batch)
                 result_buffer[i, :, :, :] = tensor.data
             end
             
             return TensorEngine.Tensor(result_buffer)
         else
-            # Versión CPU original
-            stacked = cat([t.data for t in batch]..., dims=4)  # (C, H, W, N)
-            stacked = permutedims(stacked, (4, 1, 2, 3))       # (N, C, H, W)
+            # Versión CPU
+            stacked = cat([t.data for t in consistent_batch]..., dims=4)  # (C, H, W, N)
+            stacked = permutedims(stacked, (4, 1, 2, 3))               # (N, C, H, W)
             return TensorEngine.Tensor(stacked)
         end
-    elseif nd == 4  # Tensores 4D
-        # Determinar si están en formato NCHW o WHCN inspeccionando el primer tensor
-        first_tensor = batch[1].data
-        size_dims = size(first_tensor)
         
-        if is_on_gpu
-            # Para tensores GPU, usar cat optimizado
-            return TensorEngine.Tensor(cat([t.data for t in batch]..., dims=1))
-        else
-            # Si la primera dimensión es 1, probablemente es formato NCHW (tamaño de batch 1)
-            if size_dims[1] == 1
-                # Para formato NCHW, concatenar a lo largo de la primera dimensión
-                stacked = vcat([t.data for t in batch]...)  # (N_total, C, H, W)
+    elseif nd == 4  # Tensores 4D
+        # Determinar formato inspeccionando dimensiones
+        first_dims = size(first_tensor.data)
+        
+        # Heurística mejorada para detectar formato
+        is_nchw = detect_format(first_dims) == :NCHW
+        
+        if is_nchw
+            # Para formato NCHW, concatenar a lo largo de la primera dimensión (batch)
+            if is_on_gpu
+                # GPU: usar cat optimizado
+                stacked_data = cat([t.data for t in consistent_batch]..., dims=1)
             else
-                # Código original para formato WHCN
-                stacked = cat([t.data for t in batch]..., dims=4)  # (W, H, C, N_total)
+                # CPU: usar vcat para eficiencia
+                stacked_data = vcat([t.data for t in consistent_batch]...)
             end
-            return TensorEngine.Tensor(stacked)
+        else
+            # Formato WHCN: concatenar en la última dimensión
+            stacked_data = cat([t.data for t in consistent_batch]..., dims=4)
         end
+        
+        return TensorEngine.Tensor(stacked_data)
+        
     elseif nd == 1 || nd == 2  # Etiquetas
         if is_on_gpu
-            # Versión GPU optimizada
-            return TensorEngine.Tensor(cat([t.data for t in batch]..., dims=2))
+            # GPU: concatenar en dimensión 2 para mantener formato (features, batch)
+            return TensorEngine.Tensor(cat([t.data for t in consistent_batch]..., dims=2))
         else
-            return TensorEngine.Tensor(hcat([t.data for t in batch]...))  # (num_clases, N)
+            # CPU: usar hcat
+            return TensorEngine.Tensor(hcat([t.data for t in consistent_batch]...))
         end
+        
     else
         error("Formato no soportado: ndims=$nd")
+    end
+end
+
+# Función auxiliar para detectar formato (reutilizar de Flatten)
+function detect_format(dims::Tuple)
+    if length(dims) != 4
+        return :UNKNOWN
+    end
+    
+    # Heurísticas para detectar formato:
+    # NCHW: batch suele ser pequeño (1-256), canales moderados (3-2048)
+    # WHCN: batch al final, dimensiones espaciales primero
+    
+    # Si la primera dimensión es pequeña y la segunda parece canales
+    if dims[1] <= 256 && dims[2] in [1, 3, 16, 32, 64, 128, 256, 512, 1024, 2048]
+        return :NCHW
+    # Si las primeras dos dimensiones son grandes (espaciales) y la última es pequeña (batch)
+    elseif dims[1] > 10 && dims[2] > 10 && dims[4] <= 256
+        return :WHCN
+    else
+        # Default a NCHW si no está claro
+        return :NCHW
     end
 end
 

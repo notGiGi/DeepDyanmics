@@ -16,7 +16,12 @@ let
 
         # FASE 2
         ("src/test_phase2.jl", "Test Básico FASE 2"),
-        ("test/test_integration_phase1_2.jl", "Test Integración FASE 1+2")
+        ("test/test_integration_phase1_2.jl", "Test Integración FASE 1+2"),
+        # FASE 3
+        ("test/test_phase3.jl", "Test Capas Fundamentales FASE 3"),
+        ("test/test_phase3_integration.jl", "Test Integración FASE 3"),
+        ("test/integration_test.jl", "Test Integración CNN FASE 3"),
+        ("test/test_regresion_lineal.jl", "Test Regresión Lineal FASE 3")    
     ]
 
     for (file, name) in tests

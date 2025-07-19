@@ -30,6 +30,12 @@ function Dense(input_size::Int, output_size::Int; init_method::Symbol=:xavier)
 end
 
 function forward(layer::Dense, input::TensorEngine.Tensor)
+    # Verificar dimensiones de entrada
+    expected_input_size = size(layer.weights.data, 2)
+    actual_input_size = size(input.data, 1)
+    
+    @assert actual_input_size == expected_input_size "Dense layer expects input size $expected_input_size but got $actual_input_size"
+    
     # Obtener datos
     W = layer.weights.data
     x = input.data
