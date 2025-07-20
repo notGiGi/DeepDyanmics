@@ -1,7 +1,7 @@
 module Layers
 
 using NNlib, CUDA, ..TensorEngine, ..AbstractLayer, ..ConvKernelLayers, Statistics
-export BatchNorm, Flatten, LayerActivation, GlobalAvgPool, ResidualBlock, create_residual_block, CustomFlatten, DropoutLayer
+export BatchNorm, Flatten, LayerActivation, set_training!, reset_running_stats!, GlobalAvgPool, ResidualBlock, create_residual_block, CustomFlatten, DropoutLayer
 # Añadir en Layers.jl justo antes del end del módulo
 
 # ==================================================================
@@ -10,99 +10,461 @@ export BatchNorm, Flatten, LayerActivation, GlobalAvgPool, ResidualBlock, create
 """
 Versión corregida de BatchNormalization que usa Float32 explícitamente
 """
+# BatchNorm Mejorado para DeepDynamics - Fase 4
+# Esta implementación corrige todos los problemas identificados
+
+"""
+BatchNormalization mejorada con soporte completo GPU/CPU y cálculo correcto de estadísticas
+"""
 mutable struct BatchNorm <: AbstractLayer.Layer
     gamma::TensorEngine.Tensor
     beta::TensorEngine.Tensor
-    running_mean::Array{Float32}
-    running_var::Array{Float32}
+    running_mean::Array{Float32}  # Siempre en CPU
+    running_var::Array{Float32}   # Siempre en CPU
     momentum::Float32
     epsilon::Float32
     training::Bool
+    # Nuevos campos para mejor tracking
+    num_batches_tracked::Int
 end
 
-function BatchNorm(channels::Int; momentum=Float32(0.9), epsilon=Float32(1e-5), training=true)
-    # Inicializar todos los parámetros con tipos Float32 explícitos
-    gamma = TensorEngine.Tensor(ones(Float32, channels))
-    beta = TensorEngine.Tensor(zeros(Float32, channels))
+function BatchNorm(channels::Int; momentum=Float32(0.1), epsilon=Float32(1e-5), training=true)
+    # CRÍTICO: Asegurar que los parámetros sean entrenables
+    gamma = TensorEngine.Tensor(ones(Float32, channels); requires_grad=true)
+    beta = TensorEngine.Tensor(zeros(Float32, channels); requires_grad=true)
+    
+    # Running statistics siempre en CPU
     running_mean = zeros(Float32, channels)
     running_var = ones(Float32, channels)
     
-    return BatchNorm(gamma, beta, running_mean, running_var, momentum, epsilon, training)
+    return BatchNorm(gamma, beta, running_mean, running_var, momentum, epsilon, training, 0)
 end
 
 function forward(layer::BatchNorm, input::TensorEngine.Tensor)
     x = input.data
-    # Asegurarse que los datos sean de tipo Float32
+    dims = size(x)
+    ndims_x = ndims(x)
+    
+    # Detectar dispositivo
+    is_on_gpu = x isa CUDA.CuArray
+    
+    # Asegurar Float32
     if eltype(x) != Float32
-        x = Float32.(x)
+        x = is_on_gpu ? CUDA.convert.(Float32, x) : convert.(Float32, x)
     end
     
-    # Determinar dimensiones
-    dims = ndims(x)
-    batch_size = size(x, 1)
-    num_channels = size(x, 2)
-    spatial_dims = size(x)[3:end]
-    
-    # Imprimir información de depuración
-    #println("BatchNorm: input shape = $(size(x)), gamma shape = $(size(layer.gamma.data))")
-    
-    if layer.training
-        # Normalizar por batch y dimensiones espaciales, pero no por canal
-        # Para tensores 4D: (batch, channel, height, width)
-        reduce_dims = (1, 3, 4)  # Normalizar por batch y dimensiones espaciales
+    if ndims_x == 4
+        # Formato NCHW: (batch, channel, height, width)
+        batch_size, num_channels, height, width = dims
         
-        # Calcular media y varianza por canal
-        batch_mean = dropdims(mean(x, dims=reduce_dims), dims=reduce_dims)
-        batch_var = dropdims(var(x, dims=reduce_dims), dims=reduce_dims)
+        # Verificar dimensiones
+        @assert num_channels == length(layer.gamma.data) "Número de canales no coincide"
         
-        # Asegurarnos que tienen dimensiones correctas para broadcast
-        # Para 4D: (1, C, 1, 1)
-        reshape_dims = (1, num_channels, ntuple(i -> 1, dims-2)...)
-        
-        reshaped_mean = reshape(batch_mean, reshape_dims)
-        reshaped_var = reshape(batch_var, reshape_dims)
-        
-        # Actualizar running stats
-        layer.running_mean = layer.momentum .* layer.running_mean .+ (1 - layer.momentum) .* Array(batch_mean)
-        layer.running_var = layer.momentum .* layer.running_var .+ (1 - layer.momentum) .* Array(batch_var)
-        
-        # Normalizar
-        x_normalized = (x .- reshaped_mean) ./ sqrt.(reshaped_var .+ layer.epsilon)
-    else
-        # Preparar running stats para broadcast
-        reshape_dims = (1, num_channels)
-        for _ in 1:dims-2
-            push!(reshape_dims, 1)
+        if layer.training
+            # Calcular estadísticas del batch
+            batch_mean = zeros(Float32, num_channels)
+            batch_var = zeros(Float32, num_channels)
+            
+            # Si está en GPU, traer a CPU para cálculo de estadísticas
+            x_cpu = is_on_gpu ? Array(x) : x
+            
+            # Calcular por canal
+            for c in 1:num_channels
+                channel_data = @view x_cpu[:, c, :, :]
+                batch_mean[c] = mean(channel_data)
+                batch_var[c] = var(channel_data, corrected=false)
+            end
+            
+            # Actualizar running statistics
+            layer.running_mean .= (1.0f0 - layer.momentum) .* layer.running_mean .+ layer.momentum .* batch_mean
+            layer.running_var .= (1.0f0 - layer.momentum) .* layer.running_var .+ layer.momentum .* batch_var
+            
+            layer.num_batches_tracked += 1
+            
+            mean_use = batch_mean
+            var_use = batch_var
+        else
+            # Modo eval: usar running statistics
+            mean_use = layer.running_mean
+            var_use = layer.running_var
         end
         
-        reshaped_mean = reshape(layer.running_mean, reshape_dims)
-        reshaped_var = reshape(layer.running_var, reshape_dims)
+        # Preparar estadísticas para GPU si es necesario
+        if is_on_gpu
+            mean_use = CUDA.CuArray(mean_use)
+            var_use = CUDA.CuArray(var_use)
+        end
         
-        # Normalizar usando estadísticas acumuladas
-        x_normalized = (x .- reshaped_mean) ./ sqrt.(reshaped_var .+ layer.epsilon)
+        # Normalizar
+        mean_reshaped = reshape(mean_use, (1, num_channels, 1, 1))
+        var_reshaped = reshape(var_use, (1, num_channels, 1, 1))
+        std_reshaped = sqrt.(var_reshaped .+ layer.epsilon)
+        
+        x_normalized = (x .- mean_reshaped) ./ std_reshaped
+        
+        # Aplicar parámetros gamma y beta
+        gamma_data = layer.gamma.data
+        beta_data = layer.beta.data
+        
+        # Asegurar que gamma y beta estén en el dispositivo correcto
+        if is_on_gpu
+            if !(gamma_data isa CUDA.CuArray)
+                gamma_data = CUDA.CuArray(gamma_data)
+            end
+            if !(beta_data isa CUDA.CuArray)
+                beta_data = CUDA.CuArray(beta_data)
+            end
+        else
+            if gamma_data isa CUDA.CuArray
+                gamma_data = Array(gamma_data)
+            end
+            if beta_data isa CUDA.CuArray
+                beta_data = Array(beta_data)
+            end
+        end
+        
+        gamma_reshaped = reshape(gamma_data, (1, num_channels, 1, 1))
+        beta_reshaped = reshape(beta_data, (1, num_channels, 1, 1))
+        
+        output = gamma_reshaped .* x_normalized .+ beta_reshaped
+        
+    elseif ndims_x == 2
+        # Formato (features, batch) para capas Dense
+        num_features, batch_size = dims
+        
+        @assert num_features == length(layer.gamma.data) "Número de features no coincide"
+        
+        if layer.training
+            # Calcular estadísticas sobre la dimensión del batch
+            x_cpu = is_on_gpu ? Array(x) : x
+            
+            batch_mean = mean(x_cpu, dims=2)[:, 1]
+            batch_var = var(x_cpu, dims=2, corrected=false)[:, 1]
+            
+            # Actualizar running stats
+            layer.running_mean .= (1.0f0 - layer.momentum) .* layer.running_mean .+ layer.momentum .* batch_mean
+            layer.running_var .= (1.0f0 - layer.momentum) .* layer.running_var .+ layer.momentum .* batch_var
+            
+            layer.num_batches_tracked += 1
+            
+            mean_use = batch_mean
+            var_use = batch_var
+        else
+            mean_use = layer.running_mean
+            var_use = layer.running_var
+        end
+        
+        # Preparar para GPU si es necesario
+        if is_on_gpu
+            mean_use = CUDA.CuArray(mean_use)
+            var_use = CUDA.CuArray(var_use)
+        end
+        
+        # Normalizar
+        mean_reshaped = reshape(mean_use, (num_features, 1))
+        var_reshaped = reshape(var_use, (num_features, 1))
+        std_reshaped = sqrt.(var_reshaped .+ layer.epsilon)
+        
+        x_normalized = (x .- mean_reshaped) ./ std_reshaped
+        
+        # Aplicar gamma y beta
+        gamma_data = layer.gamma.data
+        beta_data = layer.beta.data
+        
+        if is_on_gpu && !(gamma_data isa CUDA.CuArray)
+            gamma_data = CUDA.CuArray(gamma_data)
+            beta_data = CUDA.CuArray(beta_data)
+        elseif !is_on_gpu && gamma_data isa CUDA.CuArray
+            gamma_data = Array(gamma_data)
+            beta_data = Array(beta_data)
+        end
+        
+        gamma_reshaped = reshape(gamma_data, (num_features, 1))
+        beta_reshaped = reshape(beta_data, (num_features, 1))
+        
+        output = gamma_reshaped .* x_normalized .+ beta_reshaped
+        
+    else
+        error("BatchNorm: formato no soportado con $ndims_x dimensiones")
     end
     
-    # Preparar gamma y beta para broadcast
-    gamma_shape = reshape_dims
-    beta_shape = reshape_dims
+    # CRÍTICO: Determinar si necesitamos gradientes
+    # Necesitamos gradientes si:
+    # 1. El input requiere gradientes, O
+    # 2. Los parámetros (gamma/beta) requieren gradientes
+    needs_grad = input.requires_grad || layer.gamma.requires_grad || layer.beta.requires_grad
     
-    # Asegurarse de que gamma y beta tengan dimensiones correctas
-    gamma_reshaped = reshape(layer.gamma.data, gamma_shape)
-    beta_reshaped = reshape(layer.beta.data, beta_shape)
+    # Crear tensor de salida con requires_grad correcto
+    out = TensorEngine.Tensor(output; requires_grad=needs_grad)
     
-    # Aplicar parámetros gamma y beta
-    output = gamma_reshaped .* x_normalized .+ beta_reshaped
-    
-    # Crear tensor de salida 
-    out = TensorEngine.Tensor(output)
+    # CRÍTICO: Definir backward incluso en modo eval si hay gradientes
+    if needs_grad
+        # Guardar valores necesarios para backward
+        saved_mean = copy(mean_use)
+        saved_var = copy(var_use)
+        saved_normalized = copy(x_normalized)
+        saved_std = sqrt.(saved_var .+ layer.epsilon)
+        saved_x = copy(x)  # Guardar x original para gradientes de mean/var
+        
+        out.backward_fn = grad -> begin
+            grad_data = grad isa TensorEngine.Tensor ? grad.data : grad
+            
+            # Asegurar mismo dispositivo
+            if (grad_data isa CUDA.CuArray) != is_on_gpu
+                if is_on_gpu
+                    grad_data = CUDA.CuArray(grad_data)
+                else
+                    grad_data = Array(grad_data)
+                end
+            end
+            
+            if ndims_x == 4
+                # Backward para 4D mejorado
+                backward_batchnorm_4d_improved!(
+                    layer, input, grad_data, 
+                    saved_normalized, saved_mean, saved_std, saved_x,
+                    batch_size, num_channels, height, width,
+                    is_on_gpu
+                )
+            else
+                # Backward para 2D mejorado
+                backward_batchnorm_2d_improved!(
+                    layer, input, grad_data,
+                    saved_normalized, saved_mean, saved_std, saved_x,
+                    num_features, batch_size,
+                    is_on_gpu
+                )
+            end
+        end
+    end
     
     return out
 end
 
+# Función auxiliar mejorada para backward 4D
+function backward_batchnorm_4d_improved!(layer, input, grad_output, x_norm, mean_save, std_save, x_save,
+                                        N, C, H, W, is_on_gpu)
+    # Preparar datos
+    gamma_data = layer.gamma.data
+    if is_on_gpu && !(gamma_data isa CUDA.CuArray)
+        gamma_data = CUDA.CuArray(gamma_data)
+    elseif !is_on_gpu && gamma_data isa CUDA.CuArray
+        gamma_data = Array(gamma_data)
+    end
+    
+    # Reshape para broadcasting
+    gamma_reshaped = reshape(gamma_data, (1, C, 1, 1))
+    std_reshaped = reshape(std_save, (1, C, 1, 1))
+    mean_reshaped = reshape(mean_save, (1, C, 1, 1))
+    
+    # CRÍTICO: Solo calcular gradientes para parámetros que los necesitan
+    if layer.gamma.requires_grad
+        grad_gamma = sum(grad_output .* x_norm, dims=(1,3,4))[1,:,1,1]
+        if grad_gamma isa CUDA.CuArray
+            grad_gamma = Array(grad_gamma)
+        end
+        TensorEngine.backward(layer.gamma, TensorEngine.Tensor(grad_gamma; requires_grad=false))
+    end
+    
+    if layer.beta.requires_grad
+        grad_beta = sum(grad_output, dims=(1,3,4))[1,:,1,1]
+        if grad_beta isa CUDA.CuArray
+            grad_beta = Array(grad_beta)
+        end
+        TensorEngine.backward(layer.beta, TensorEngine.Tensor(grad_beta; requires_grad=false))
+    end
+    
+    # Gradiente para input solo si es necesario
+    if input.requires_grad
+        if layer.training
+            # Training mode: full gradient computation
+            M = Float32(N * H * W)
+            
+            # Términos intermedios
+            grad_xnorm = grad_output .* gamma_reshaped
+            
+            # Gradientes más estables
+            term1 = grad_xnorm ./ std_reshaped
+            term2 = sum(grad_xnorm .* x_norm, dims=(1,3,4)) ./ (M * std_reshaped)
+            term3 = sum(grad_xnorm, dims=(1,3,4)) .* mean_reshaped ./ (M * std_reshaped)
+            
+            grad_input = term1 .- x_norm .* term2 .- term3
+        else
+            # Eval mode: simplified gradient
+            grad_input = (grad_output .* gamma_reshaped) ./ std_reshaped
+        end
+        
+        TensorEngine.backward(input, TensorEngine.Tensor(grad_input; requires_grad=false))
+    end
+end
 
-# Hacer que la capa sea callable directamente
+# Función auxiliar mejorada para backward 2D
+function backward_batchnorm_2d_improved!(layer, input, grad_output, x_norm, mean_save, std_save, x_save,
+                                        F, B, is_on_gpu)
+    # Similar a 4D pero para formato 2D
+    gamma_data = layer.gamma.data
+    if is_on_gpu && !(gamma_data isa CUDA.CuArray)
+        gamma_data = CUDA.CuArray(gamma_data)
+    elseif !is_on_gpu && gamma_data isa CUDA.CuArray
+        gamma_data = Array(gamma_data)
+    end
+    
+    gamma_reshaped = reshape(gamma_data, (F, 1))
+    std_reshaped = reshape(std_save, (F, 1))
+    mean_reshaped = reshape(mean_save, (F, 1))
+    
+    # Gradientes para parámetros
+    if layer.gamma.requires_grad
+        grad_gamma = sum(grad_output .* x_norm, dims=2)[:, 1]
+        if grad_gamma isa CUDA.CuArray
+            grad_gamma = Array(grad_gamma)
+        end
+        TensorEngine.backward(layer.gamma, TensorEngine.Tensor(grad_gamma; requires_grad=false))
+    end
+    
+    if layer.beta.requires_grad
+        grad_beta = sum(grad_output, dims=2)[:, 1]
+        if grad_beta isa CUDA.CuArray
+            grad_beta = Array(grad_beta)
+        end
+        TensorEngine.backward(layer.beta, TensorEngine.Tensor(grad_beta; requires_grad=false))
+    end
+    
+    # Gradiente para input
+    if input.requires_grad
+        if layer.training
+            M = Float32(B)
+            grad_xnorm = grad_output .* gamma_reshaped
+            
+            term1 = grad_xnorm ./ std_reshaped
+            term2 = sum(grad_xnorm .* x_norm, dims=2) ./ (M * std_reshaped)
+            term3 = sum(grad_xnorm, dims=2) .* mean_reshaped ./ (M * std_reshaped)
+            
+            grad_input = term1 .- x_norm .* term2 .- term3
+        else
+            grad_input = (grad_output .* gamma_reshaped) ./ std_reshaped
+        end
+        
+        TensorEngine.backward(input, TensorEngine.Tensor(grad_input; requires_grad=false))
+    end
+end
+
+# Función auxiliar para backward 4D
+function backward_batchnorm_4d!(layer, input, grad_output, x_norm, mean_save, std_save,
+                                N, C, H, W, is_on_gpu)
+    # Preparar datos
+    gamma_data = layer.gamma.data
+    if is_on_gpu && !(gamma_data isa CUDA.CuArray)
+        gamma_data = CUDA.CuArray(gamma_data)
+    elseif !is_on_gpu && gamma_data isa CUDA.CuArray
+        gamma_data = Array(gamma_data)
+    end
+    
+    # Reshape para broadcasting
+    gamma_reshaped = reshape(gamma_data, (1, C, 1, 1))
+    std_reshaped = reshape(std_save, (1, C, 1, 1))
+    
+    # Gradientes para gamma y beta
+    grad_gamma = sum(grad_output .* x_norm, dims=(1,3,4))[1,:,1,1]
+    grad_beta = sum(grad_output, dims=(1,3,4))[1,:,1,1]
+    
+    # Asegurar que estén en CPU para acumulación
+    if grad_gamma isa CUDA.CuArray
+        grad_gamma = Array(grad_gamma)
+        grad_beta = Array(grad_beta)
+    end
+    
+    # Gradiente para input
+    if layer.training
+        # Training mode: full gradient computation
+        M = N * H * W  # número total de elementos por canal
+        
+        # Términos intermedios
+        grad_xnorm = grad_output .* gamma_reshaped
+        grad_var = sum(grad_xnorm .* x_norm .* (-0.5f0) ./ (std_reshaped .^ 3), dims=(1,3,4))
+        grad_mean = sum(grad_xnorm ./ (-std_reshaped), dims=(1,3,4))
+        
+        # Input gradient
+        grad_input = (grad_xnorm ./ std_reshaped) .+ 
+                     (grad_var .* 2.0f0 .* (input.data .- reshape(mean_save, (1,C,1,1))) ./ M) .+
+                     (grad_mean ./ M)
+    else
+        # Eval mode: simplified gradient
+        grad_input = (grad_output .* gamma_reshaped) ./ std_reshaped
+    end
+    
+    # Propagar gradientes
+    TensorEngine.backward(layer.gamma, TensorEngine.Tensor(grad_gamma; requires_grad=false))
+    TensorEngine.backward(layer.beta, TensorEngine.Tensor(grad_beta; requires_grad=false))
+    TensorEngine.backward(input, TensorEngine.Tensor(grad_input; requires_grad=false))
+end
+
+# Función auxiliar para backward 2D
+function backward_batchnorm_2d!(layer, input, grad_output, x_norm, mean_save, std_save,
+                                F, B, is_on_gpu)
+    # Similar a 4D pero para formato 2D
+    gamma_data = layer.gamma.data
+    if is_on_gpu && !(gamma_data isa CUDA.CuArray)
+        gamma_data = CUDA.CuArray(gamma_data)
+    elseif !is_on_gpu && gamma_data isa CUDA.CuArray
+        gamma_data = Array(gamma_data)
+    end
+    
+    gamma_reshaped = reshape(gamma_data, (F, 1))
+    std_reshaped = reshape(std_save, (F, 1))
+    
+    # Gradientes para parámetros
+    grad_gamma = sum(grad_output .* x_norm, dims=2)[:, 1]
+    grad_beta = sum(grad_output, dims=2)[:, 1]
+    
+    if grad_gamma isa CUDA.CuArray
+        grad_gamma = Array(grad_gamma)
+        grad_beta = Array(grad_beta)
+    end
+    
+    # Gradiente para input
+    if layer.training
+        grad_xnorm = grad_output .* gamma_reshaped
+        grad_var = sum(grad_xnorm .* x_norm .* (-0.5f0) ./ (std_reshaped .^ 3), dims=2)
+        grad_mean = sum(grad_xnorm ./ (-std_reshaped), dims=2)
+        
+        grad_input = (grad_xnorm ./ std_reshaped) .+ 
+                     (grad_var .* 2.0f0 .* (input.data .- reshape(mean_save, (F,1))) ./ B) .+
+                     (grad_mean ./ B)
+    else
+        grad_input = (grad_output .* gamma_reshaped) ./ std_reshaped
+    end
+    
+    # Propagar gradientes
+    TensorEngine.backward(layer.gamma, TensorEngine.Tensor(grad_gamma; requires_grad=false))
+    TensorEngine.backward(layer.beta, TensorEngine.Tensor(grad_beta; requires_grad=false))
+    TensorEngine.backward(input, TensorEngine.Tensor(grad_input; requires_grad=false))
+end
+
+# Hacer callable
 function (layer::BatchNorm)(input::TensorEngine.Tensor)
     return forward(layer, input)
+end
+
+# Funciones de utilidad
+function set_training!(layer::BatchNorm, training::Bool)
+    layer.training = training
+end
+
+function reset_running_stats!(layer::BatchNorm)
+    fill!(layer.running_mean, 0f0)
+    fill!(layer.running_var, 1f0)
+    layer.num_batches_tracked = 0
+end
+
+# Para debugging
+function get_stats(layer::BatchNorm)
+    return (
+        mean = copy(layer.running_mean),
+        var = copy(layer.running_var),
+        num_batches = layer.num_batches_tracked,
+        training = layer.training
+    )
 end
 
 # ==================================================================

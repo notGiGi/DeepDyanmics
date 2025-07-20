@@ -39,7 +39,7 @@ using .AbstractLayer: Layer3
 using .Visualizations
 using .ReshapeModule: Reshape
 using .Losses: binary_crossentropy, categorical_crossentropy
-using .Layers:  BatchNorm, Flatten, swish, mish, GlobalAvgPool, DropoutLayer, LayerActivation
+using .Layers:  BatchNorm, set_training!, reset_running_stats!, Flatten, swish, mish, GlobalAvgPool, DropoutLayer, LayerActivation
 using .ConvolutionalLayers: Conv2D, MaxPooling, Conv2DTranspose
 using .EmbeddingLayer: Embedding, embedding_forward
 using DeepDynamics.NeuralNetwork: softmax 
@@ -77,7 +77,8 @@ export Tensor,
        UNet, load_vgg16, stack_batch, Activation, optim_step!, ConvKernelLayer, apply_augmentation, 
        augment_batch, StepScheduler, CosineAnnealingScheduler, get_lr, train_improved!, DropoutLayer,
        create_resnet, create_simple_cnn, LayerActivation, apply_augmentation, augment_batch,
-       get_tensor_buffer, release_tensor_buffer, clear_cache, DataLoader, optimized_data_loader, zero_grad!, add, backward, mse_loss
+       get_tensor_buffer, release_tensor_buffer, clear_cache, DataLoader, optimized_data_loader, zero_grad!, add, backward, mse_loss,
+       set_training!, reset_running_stats!
 
 # Funciones para mover modelos a GPU/CPU
 function model_to_gpu(model::NeuralNetwork.Sequential)
