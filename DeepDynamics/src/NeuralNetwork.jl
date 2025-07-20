@@ -227,11 +227,35 @@ function collect_parameters(model::Sequential)
     for layer in model.layers
         if layer isa Dense
             push!(params, layer.weights, layer.biases)
-        elseif layer isa BatchNorm
+        elseif layer isa Layers.BatchNorm  # Usar namespace completo
             push!(params, layer.gamma, layer.beta)
         elseif layer isa ConvKernelLayers.ConvKernelLayer
-            push!(params, TensorEngine.Tensor(layer.weights), TensorEngine.Tensor(layer.bias))
+            # Verificar si ya son Tensors antes de convertir
+            if layer.weights isa TensorEngine.Tensor
+                push!(params, layer.weights)
+            else
+                push!(params, TensorEngine.Tensor(layer.weights))
+            end
+            if layer.bias isa TensorEngine.Tensor
+                push!(params, layer.bias)
+            else
+                push!(params, TensorEngine.Tensor(layer.bias))
+            end
+        elseif layer isa ConvolutionalLayers.Conv2D
+            push!(params, layer.weights, layer.bias)
+            if layer.use_batchnorm && layer.gamma !== nothing
+                push!(params, layer.gamma, layer.beta)
+            end
+        elseif layer isa Layers.ResidualBlock
+            # Recolectar parámetros de bloques residuales recursivamente
+            for sublayer in layer.conv_path
+                append!(params, collect_parameters(Sequential([sublayer])))
+            end
+            for sublayer in layer.shortcut
+                append!(params, collect_parameters(Sequential([sublayer])))
+            end
         end
+        # Activation, Flatten, MaxPooling, etc. no tienen parámetros
     end
     return params
 end
