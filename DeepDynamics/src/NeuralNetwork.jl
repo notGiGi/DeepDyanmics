@@ -145,79 +145,123 @@ function (a::Activation)(x::AbstractArray)
 end
 
 # ==================================================================
-# Funciones de Activación Optimizadas
+# Funciones de Activación — versión que preserva requires_grad
 # ==================================================================
+
+"""
+    _new_activation_tensor(data, parent::Tensor)
+
+Crea un Tensor que:
+  • copia `data`  
+  • hereda `requires_grad` de `parent`
+"""
+function _new_activation_tensor(data, parent::TensorEngine.Tensor)
+    TensorEngine.Tensor(
+        data;
+        requires_grad = parent.requires_grad   #  ← CLAVE
+    )
+end
+
+# ---------- ReLU ----------
 function relu(t::TensorEngine.Tensor)
-    data_out = max.(t.data, 0.0f0)
-    out = TensorEngine.Tensor(data_out)
-    out.backward_fn = grad -> begin
-        TensorEngine.backward(t, TensorEngine.Tensor((t.data .> 0) .* grad))
+    out = _new_activation_tensor(max.(t.data, 0f0), t)
+    if out.requires_grad
+        out.backward_fn = grad -> TensorEngine.backward(
+            t,
+            TensorEngine.Tensor((t.data .> 0f0) .* grad)
+        )
     end
     return out
 end
 
+# ---------- Sigmoid ----------
 function sigmoid(t::TensorEngine.Tensor)
-    data_out = 1.0f0 ./ (1.0f0 .+ exp.(-t.data))
-    out = TensorEngine.Tensor(data_out)
-    out.backward_fn = grad -> begin
-        TensorEngine.backward(t, TensorEngine.Tensor(data_out .* (1.0f0 .- data_out) .* grad))
+    σ = 1f0 ./ (1f0 .+ exp.(-t.data))
+    out = _new_activation_tensor(σ, t)
+    if out.requires_grad
+        out.backward_fn = grad -> TensorEngine.backward(
+            t,
+            TensorEngine.Tensor(σ .* (1f0 .- σ) .* grad)
+        )
     end
     return out
 end
 
+# ---------- Tanh ----------
 function tanh_activation(t::TensorEngine.Tensor)
-    data_out = tanh.(t.data)
-    out = TensorEngine.Tensor(data_out)
-    out.backward_fn = grad -> begin
-        TensorEngine.backward(t, TensorEngine.Tensor((1.0f0 .- data_out.^2) .* grad))
+    τ = tanh.(t.data)
+    out = _new_activation_tensor(τ, t)
+    if out.requires_grad
+        out.backward_fn = grad -> TensorEngine.backward(
+            t,
+            TensorEngine.Tensor((1f0 .- τ.^2) .* grad)
+        )
     end
     return out
 end
 
-function leaky_relu(t::TensorEngine.Tensor; α=0.01f0)
-    data_out = max.(t.data, α .* t.data)
-    out = TensorEngine.Tensor(data_out)
-    out.backward_fn = grad -> begin
-        derivative = map(x -> x > 0 ? 1.0f0 : α, t.data)
-        TensorEngine.backward(t, TensorEngine.Tensor(derivative .* grad))
+# ---------- Leaky‑ReLU ----------
+function leaky_relu(t::TensorEngine.Tensor; α = 0.01f0)
+    y  = max.(t.data, α .* t.data)
+    out = _new_activation_tensor(y, t)
+    if out.requires_grad
+        deriv = map(x -> x > 0f0 ? 1f0 : α, t.data)
+        out.backward_fn = grad -> TensorEngine.backward(
+            t,
+            TensorEngine.Tensor(deriv .* grad)
+        )
     end
     return out
 end
 
+# ---------- Swish ----------
 function swish(t::TensorEngine.Tensor)
-    s = 1.0f0 ./ (1.0f0 .+ exp.(-t.data))
-    out_data = t.data .* s
-    out = TensorEngine.Tensor(out_data)
-    out.backward_fn = grad -> begin
-        grad_val = s .+ t.data .* s .* (1.0f0 .- s)
-        TensorEngine.backward(t, TensorEngine.Tensor(grad .* grad_val))
+    σ = 1f0 ./ (1f0 .+ exp.(-t.data))
+    y = t.data .* σ
+    out = _new_activation_tensor(y, t)
+    if out.requires_grad
+        grad_factor = σ .+ t.data .* σ .* (1f0 .- σ)
+        out.backward_fn = grad -> TensorEngine.backward(
+            t,
+            TensorEngine.Tensor(grad .* grad_factor)
+        )
     end
     return out
 end
 
+# ---------- Mish ----------
 function mish(t::TensorEngine.Tensor)
-    softplus = log.(1.0f0 .+ exp.(t.data))
-    tanh_sp = tanh.(softplus)
-    out_data = t.data .* tanh_sp
-    out = TensorEngine.Tensor(out_data)
-    out.backward_fn = grad -> begin
-        δ = tanh_sp .+ t.data .* (1.0f0 .- tanh_sp.^2) .* (exp.(t.data) ./ (1.0f0 .+ exp.(t.data)))
-        TensorEngine.backward(t, TensorEngine.Tensor(grad .* δ))
+    sp = log.(1f0 .+ exp.(t.data))        # softplus
+    τ  = tanh.(sp)
+    y  = t.data .* τ
+    out = _new_activation_tensor(y, t)d
+    if out.requires_grad
+        δ = τ .+ t.data .* (1f0 .- τ.^2) .* (exp.(t.data) ./ (1f0 .+ exp.(t.data)))
+        out.backward_fn = grad -> TensorEngine.backward(
+            t,
+            TensorEngine.Tensor(grad .* δ)
+        )
     end
     return out
 end
 
-function softmax(t::TensorEngine.Tensor)::Tensor
-    max_val = maximum(t.data)
-    log_sum_exp = log.(sum(exp.(t.data .- max_val))) + max_val
-    probs = exp.(t.data .- log_sum_exp)
-    out = TensorEngine.Tensor(probs)
+# ---------- Softmax ----------
+function softmax(t::TensorEngine.Tensor)::TensorEngine.Tensor
+    max_val      = maximum(t.data)
+    log_sum_exp  = log.(sum(exp.(t.data .- max_val))) + max_val
+    probs        = exp.(t.data .- log_sum_exp)
+
+    # ➊ conservar el flag
+    out = TensorEngine.Tensor(probs; requires_grad = t.requires_grad)
+
+    # ➋ mantener el backward
     out.backward_fn = grad -> begin
         grad_input = probs .* (grad .- sum(probs .* grad, dims=1))
         TensorEngine.backward(t, TensorEngine.Tensor(grad_input))
     end
     return out
 end
+
 
 # ==================================================================
 # Funciones de Ayuda
@@ -260,83 +304,148 @@ function collect_parameters(model::Sequential)
     return params
 end
 
+"""
+    model_to_gpu(model::Sequential) → Sequential
+
+Crea una copia del `Sequential` donde **todos los tensores que
+requieren gradiente** pasan a `CuArray`, preservando su bandera
+`requires_grad`.  
+Los tensores que no requieren gradiente se copian igualmente para que
+estén en la GPU (por coherencia de dispositivo), pero con
+`requires_grad = false`.
+"""
 function model_to_gpu(model::Sequential)
-    layers_gpu = []
+    layers_gpu = Vector{AbstractLayer.Layer}()
+
     for layer in model.layers
+        ##################################################################
+        # 1. Dense
+        ##################################################################
         if layer isa Dense
-            weights_gpu = TensorEngine.Tensor(CUDA.CuArray(layer.weights.data))
-            biases_gpu  = TensorEngine.Tensor(CUDA.CuArray(layer.biases.data))
-            push!(layers_gpu, Dense(weights_gpu, biases_gpu))
+            Wg = TensorEngine.Tensor(
+                     CUDA.CuArray(layer.weights.data);
+                     requires_grad = layer.weights.requires_grad)
+
+            bg = TensorEngine.Tensor(
+                     CUDA.CuArray(layer.biases.data);
+                     requires_grad = layer.biases.requires_grad)
+
+            push!(layers_gpu, Dense(Wg, bg))
+
+        ##################################################################
+        # 2. Conv2D  (con o sin BatchNorm interno)
+        ##################################################################
         elseif layer isa ConvolutionalLayers.Conv2D
-            weights_gpu = TensorEngine.Tensor(CUDA.CuArray(layer.weights.data))
-            bias_gpu    = TensorEngine.Tensor(CUDA.CuArray(layer.bias.data))
-            gamma_gpu   = layer.use_batchnorm ? TensorEngine.Tensor(CUDA.CuArray(layer.gamma.data)) : nothing
-            beta_gpu    = layer.use_batchnorm ? TensorEngine.Tensor(CUDA.CuArray(layer.beta.data))  : nothing
-            new_conv = ConvolutionalLayers.Conv2D(weights_gpu, bias_gpu, layer.stride, layer.padding, layer.use_batchnorm, gamma_gpu, beta_gpu)
+            Wg = TensorEngine.Tensor(
+                     CUDA.CuArray(layer.weights.data);
+                     requires_grad = layer.weights.requires_grad)
+
+            bg = TensorEngine.Tensor(
+                     CUDA.CuArray(layer.bias.data);
+                     requires_grad = layer.bias.requires_grad)
+
+            γg = layer.use_batchnorm && layer.gamma !== nothing ?
+                     TensorEngine.Tensor(
+                         CUDA.CuArray(layer.gamma.data);
+                         requires_grad = layer.gamma.requires_grad) : nothing
+
+            βg = layer.use_batchnorm && layer.beta  !== nothing ?
+                     TensorEngine.Tensor(
+                         CUDA.CuArray(layer.beta.data);
+                         requires_grad = layer.beta.requires_grad)  : nothing
+
+            new_conv = ConvolutionalLayers.Conv2D(
+                           Wg, bg, layer.stride, layer.padding,
+                           layer.use_batchnorm, γg, βg)
+
             push!(layers_gpu, new_conv)
+
+        ##################################################################
+        # 3. ConvKernelLayer
+        ##################################################################
         elseif layer isa ConvKernelLayers.ConvKernelLayer
-            new_conv = ConvKernelLayers.ConvKernelLayer(layer.in_channels, layer.out_channels, layer.kernel_size,
-                                       layer.stride, layer.padding,
-                                       TensorEngine.to_gpu(layer.weights),
-                                       TensorEngine.to_gpu(layer.bias),
-                                       TensorEngine.to_gpu(layer.gradW),
-                                       TensorEngine.to_gpu(layer.gradB))
+            new_conv = ConvKernelLayers.ConvKernelLayer(
+                           layer.in_channels, layer.out_channels, layer.kernel_size,
+                           layer.stride, layer.padding,
+                           TensorEngine.Tensor(
+                               CUDA.CuArray(layer.weights.data);
+                               requires_grad = layer.weights.requires_grad),
+                           TensorEngine.Tensor(
+                               CUDA.CuArray(layer.bias.data);
+                               requires_grad = layer.bias.requires_grad),
+                           TensorEngine.Tensor(
+                               CUDA.CuArray(layer.gradW.data); requires_grad = false),
+                           TensorEngine.Tensor(
+                               CUDA.CuArray(layer.gradB.data); requires_grad = false))
             push!(layers_gpu, new_conv)
-        elseif layer isa ConvolutionalLayers.MaxPooling || layer isa GlobalAvgPool || layer isa Flatten
-            push!(layers_gpu, layer)
-        elseif layer isa Reshape
-            push!(layers_gpu, Reshape(layer.output_shape))
-        elseif layer isa Layers.DropoutLayer
-            # DropoutLayer no tiene parámetros que mover
-            push!(layers_gpu, layer)
+
+        ##################################################################
+        # 4. BatchNorm
+        ##################################################################
         elseif layer isa Layers.BatchNorm
-            # Obtener el número de canales de gamma
-            channels = length(layer.gamma.data)
-            
-            # Crear nuevo BatchNorm con el mismo número de canales y configuración
-            new_bn = Layers.BatchNorm(channels, 
-                                    momentum=layer.momentum, 
-                                    epsilon=layer.epsilon, 
-                                    training=layer.training)
-            
-            # Reemplazar gamma y beta con versiones en GPU
-            new_bn.gamma = TensorEngine.Tensor(CUDA.CuArray(layer.gamma.data))
-            new_bn.beta = TensorEngine.Tensor(CUDA.CuArray(layer.beta.data))
-            
-            # Copiar running_mean y running_var (se quedan en CPU)
-            new_bn.running_mean = copy(layer.running_mean)
-            new_bn.running_var = copy(layer.running_var)
-            
+            ch = length(layer.gamma.data)
+            new_bn = Layers.BatchNorm(ch;
+                                      momentum = layer.momentum,
+                                      epsilon  = layer.epsilon,
+                                      training = layer.training)
+
+            #  ── copiar parámetros conservando requires_grad ────────────
+            new_bn.gamma = TensorEngine.Tensor(
+                               CUDA.CuArray(layer.gamma.data);
+                               requires_grad = layer.gamma.requires_grad)
+
+            new_bn.beta  = TensorEngine.Tensor(
+                               CUDA.CuArray(layer.beta.data);
+                               requires_grad = layer.beta.requires_grad)
+
+            # running stats (buffers) siguen en CPU
+            new_bn.running_mean .= layer.running_mean
+            new_bn.running_var  .= layer.running_var
+            new_bn.num_batches_tracked = layer.num_batches_tracked
+
             push!(layers_gpu, new_bn)
+
+        ##################################################################
+        # 5. Bloques residuales  (procesar recursivamente)
+        ##################################################################
         elseif layer isa Layers.ResidualBlock
-            # Procesar las capas del camino convolucional recursivamente
             conv_path_gpu = AbstractLayer.Layer[]
-            for sublayer in layer.conv_path
-                temp_model = Sequential([sublayer])
-                temp_gpu = model_to_gpu(temp_model)  # Llamada recursiva
-                push!(conv_path_gpu, temp_gpu.layers[1])
+            for sub in layer.conv_path
+                push!(conv_path_gpu,
+                      model_to_gpu(Sequential([sub])).layers[1])
             end
-            
-            # Procesar las capas del shortcut recursivamente
+
             shortcut_gpu = AbstractLayer.Layer[]
-            for sublayer in layer.shortcut
-                temp_model = Sequential([sublayer])
-                temp_gpu = model_to_gpu(temp_model)  # Llamada recursiva
-                push!(shortcut_gpu, temp_gpu.layers[1])
+            for sub in layer.shortcut
+                push!(shortcut_gpu,
+                      model_to_gpu(Sequential([sub])).layers[1])
             end
-            
-            # Crear nuevo bloque residual con capas en GPU
-            new_residual = Layers.ResidualBlock(conv_path_gpu, shortcut_gpu)
-            push!(layers_gpu, new_residual)
-        elseif layer isa Activation
-            push!(layers_gpu, Activation(layer.f))
-        elseif layer isa Layers.LayerActivation
-            push!(layers_gpu, Layers.LayerActivation(layer.f))
+
+            push!(layers_gpu, Layers.ResidualBlock(conv_path_gpu, shortcut_gpu))
+
+        ##################################################################
+        # 6. Capas sin parámetros (se copian tal cual)
+        ##################################################################
+        elseif layer isa ConvolutionalLayers.MaxPooling ||
+               layer isa GlobalAvgPool                    ||
+               layer isa Flatten                          ||
+               layer isa Reshape                          ||
+               layer isa Layers.DropoutLayer              ||
+               layer isa Activation                       ||
+               layer isa Layers.LayerActivation
+            push!(layers_gpu, layer)
+
+        ##################################################################
+        # 7. Tipo desconocido
+        ##################################################################
         else
-            error("Tipo de capa no soportado: $(typeof(layer))")
+            error("Tipo de capa no soportado en model_to_gpu: $(typeof(layer))")
         end
     end
+
     return Sequential(layers_gpu)
 end
+
+
 
 end # module NeuralNetwork

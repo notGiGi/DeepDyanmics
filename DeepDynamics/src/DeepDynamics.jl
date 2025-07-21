@@ -34,16 +34,14 @@ include("Models.jl")
 using .TensorEngine: Tensor, backward, mse_loss, 
        initialize_grad!, initialize_weights, l2_regularization,
        compute_loss_with_regularization, clip_gradients!, 
-       to_gpu, to_cpu, softmax, zero_grad!, add
-using .AbstractLayer: Layer3
+       to_gpu, to_cpu, zero_grad!, add
 using .Visualizations
 using .ReshapeModule: Reshape
 using .Losses: binary_crossentropy, categorical_crossentropy
 using .Layers:  BatchNorm, set_training!, reset_running_stats!, Flatten, swish, mish, GlobalAvgPool, DropoutLayer, LayerActivation
 using .ConvolutionalLayers: Conv2D, MaxPooling, Conv2DTranspose
 using .EmbeddingLayer: Embedding, embedding_forward
-using DeepDynamics.NeuralNetwork: softmax 
-using .NeuralNetwork: Sequential, Dense, Activation, collect_parameters, relu, sigmoid, tanh_activation, leaky_relu
+using .NeuralNetwork: Sequential, Dense, Activation, collect_parameters, relu, softmax, sigmoid, tanh_activation, leaky_relu
 using .Optimizers: SGD, Adam, RMSProp, Adagrad, Nadam
 using .Optimizers: step! as optim_step!  # Renombrar para evitar conflicto
 using .Metrics: accuracy, mae, rmse, f1_score, precision, recall, binary_accuracy

@@ -232,43 +232,24 @@ end
 
 # Forward pass en CPU: utiliza NNlib.conv
 function _cpu_forward!(layer::ConvKernelLayer, x::Array{Float32,4})
-    # Detectar formato de entrada basado en dimensiones
-    input_dims = size(x)
+    # Verificar formato NCHW
+    N, C_in, H_in, W_in = size(x)
     
-    if length(input_dims) == 4
-        # Verificar si las dimensiones parecen estar en formato NCHW o WHCN
-        if input_dims[2] == layer.in_channels  # Probablemente NCHW (N,C,H,W)
-            println("Formato detectado: NCHW")
-            N, C_in, H_in, W_in = input_dims
-            
-            # Convertir a formato WHCN que espera _cpu_forward!
-            x_whcn = permutedims(x, (4, 3, 2, 1))
-            
-            # Ahora sí, llamar a la implementación original
-            W = permutedims(Array(layer.weights), (3, 4, 2, 1))
-            
-            # Usar NNlib.conv directamente
-            x_hwcn = permutedims(x_whcn, (2, 1, 3, 4))  # WHCN -> HWCN
-            y = NNlib.conv(x_hwcn, W; stride=layer.stride, pad=layer.padding)
-            y .+= Array(layer.bias)
-            
-            # Convertir de vuelta al formato NCHW para mantener consistencia
-            y_whcn = permutedims(y, (2, 1, 3, 4))  # HWCN -> WHCN
-            y_nchw = permutedims(y_whcn, (4, 3, 2, 1))  # WHCN -> NCHW
-            
-            return y_nchw
-        else  # Formato WHCN original
-            @assert size(x,3) == layer.in_channels "Input channels mismatch"
-            # Implementación original
-            x_hwcn = permutedims(x, (2, 1, 3, 4))
-            W = permutedims(Array(layer.weights), (3, 4, 2, 1))
-            y = NNlib.conv(x_hwcn, W; stride=layer.stride, pad=layer.padding)
-            y .+= Array(layer.bias)
-            return permutedims(y, (2, 1, 3, 4))
-        end
-    else
-        error("Formato de entrada no soportado")
+    if C_in != layer.in_channels
+        error("Canales de entrada no coinciden: esperado $(layer.in_channels), recibió $C_in")
     end
+    
+    # Convertir pesos de (out,in,h,w) a formato NNlib (h,w,in,out)
+    W_nnlib = permutedims(layer.weights, (3, 4, 2, 1))
+    
+    # NNlib conv mantiene formato NCHW
+    y = NNlib.conv(x, W_nnlib; stride=layer.stride, pad=layer.padding)
+    
+    # Añadir bias - ya está en formato (1,1,out,1), convertir a (1,out,1,1)
+    bias_reshaped = reshape(layer.bias[1,1,:,1], (1, layer.out_channels, 1, 1))
+    y = y .+ bias_reshaped
+    
+    return y  # Mantiene formato NCHW
 end
 
 # Método forward que despacha según el tipo de input

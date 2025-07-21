@@ -438,15 +438,15 @@ end
 
 
 
-# ---------------------------------------------------------------------------
-# Función Softmax
-# ---------------------------------------------------------------------------
-function softmax(x::Tensor)::Tensor
-    exps = exp.(x.data .- maximum(x.data))
-    sum_exps = sum(exps)
-    probs = exps ./ sum_exps
-    return Tensor(probs; requires_grad=x.requires_grad)
-end
+# ------------- antiguo -------------
+# function softmax(x::Tensor)::Tensor
+#     exps      = exp.(x.data .- maximum(x.data))
+#     sum_exps  = sum(exps)
+#     probs     = exps ./ sum_exps
+#     return Tensor(probs; requires_grad = x.requires_grad)
+# end
+# -----------------------------------
+
 
 # ---------------------------------------------------------------------------
 # Funciones para mover tensores a GPU/CPU

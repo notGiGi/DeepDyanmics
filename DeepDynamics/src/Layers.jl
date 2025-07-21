@@ -240,112 +240,111 @@ function forward(layer::BatchNorm, input::TensorEngine.Tensor)
     
     return out
 end
+"Acumula `g` en `param.grad` respetando dispositivo y tipo"
+function _accum_grad!(param::TensorEngine.Tensor, g)
+    # 1.  Mover g al mismo dispositivo que param.data
+    if (param.data isa CUDA.CuArray) != (g isa CUDA.CuArray)
+        g = param.data isa CUDA.CuArray ? CUDA.CuArray(g) : Array(g)
+    end
 
-# Función auxiliar mejorada para backward 4D
-function backward_batchnorm_4d_improved!(layer, input, grad_output, x_norm, mean_save, std_save, x_save,
-                                        N, C, H, W, is_on_gpu)
-    # Preparar datos
-    gamma_data = layer.gamma.data
-    if is_on_gpu && !(gamma_data isa CUDA.CuArray)
-        gamma_data = CUDA.CuArray(gamma_data)
-    elseif !is_on_gpu && gamma_data isa CUDA.CuArray
-        gamma_data = Array(gamma_data)
-    end
-    
-    # Reshape para broadcasting
-    gamma_reshaped = reshape(gamma_data, (1, C, 1, 1))
-    std_reshaped = reshape(std_save, (1, C, 1, 1))
-    mean_reshaped = reshape(mean_save, (1, C, 1, 1))
-    
-    # CRÍTICO: Solo calcular gradientes para parámetros que los necesitan
-    if layer.gamma.requires_grad
-        grad_gamma = sum(grad_output .* x_norm, dims=(1,3,4))[1,:,1,1]
-        if grad_gamma isa CUDA.CuArray
-            grad_gamma = Array(grad_gamma)
-        end
-        TensorEngine.backward(layer.gamma, TensorEngine.Tensor(grad_gamma; requires_grad=false))
-    end
-    
-    if layer.beta.requires_grad
-        grad_beta = sum(grad_output, dims=(1,3,4))[1,:,1,1]
-        if grad_beta isa CUDA.CuArray
-            grad_beta = Array(grad_beta)
-        end
-        TensorEngine.backward(layer.beta, TensorEngine.Tensor(grad_beta; requires_grad=false))
-    end
-    
-    # Gradiente para input solo si es necesario
-    if input.requires_grad
-        if layer.training
-            # Training mode: full gradient computation
-            M = Float32(N * H * W)
-            
-            # Términos intermedios
-            grad_xnorm = grad_output .* gamma_reshaped
-            
-            # Gradientes más estables
-            term1 = grad_xnorm ./ std_reshaped
-            term2 = sum(grad_xnorm .* x_norm, dims=(1,3,4)) ./ (M * std_reshaped)
-            term3 = sum(grad_xnorm, dims=(1,3,4)) .* mean_reshaped ./ (M * std_reshaped)
-            
-            grad_input = term1 .- x_norm .* term2 .- term3
-        else
-            # Eval mode: simplified gradient
-            grad_input = (grad_output .* gamma_reshaped) ./ std_reshaped
-        end
-        
-        TensorEngine.backward(input, TensorEngine.Tensor(grad_input; requires_grad=false))
+    # 2.  Crear o acumular
+    if param.grad === nothing
+        param.grad = TensorEngine.Tensor(g; requires_grad = false)
+    else
+        param.grad.data .+= g
     end
 end
 
-# Función auxiliar mejorada para backward 2D
-function backward_batchnorm_2d_improved!(layer, input, grad_output, x_norm, mean_save, std_save, x_save,
-                                        F, B, is_on_gpu)
-    # Similar a 4D pero para formato 2D
+# backward mejorado ‑ 4‑D  (N,C,H,W)
+# ---------------------------------------------------------------------
+function backward_batchnorm_4d_improved!(layer, input, grad_output, x_norm,
+                                         mean_save, std_save, x_save,
+                                         N, C, H, W, is_on_gpu)
+
+    # Aseguramos que gamma está en el mismo dispositivo que grad_output
     gamma_data = layer.gamma.data
     if is_on_gpu && !(gamma_data isa CUDA.CuArray)
         gamma_data = CUDA.CuArray(gamma_data)
-    elseif !is_on_gpu && gamma_data isa CUDA.CuArray
+    elseif !is_on_gpu &&  (gamma_data isa CUDA.CuArray)
         gamma_data = Array(gamma_data)
     end
-    
-    gamma_reshaped = reshape(gamma_data, (F, 1))
-    std_reshaped = reshape(std_save, (F, 1))
-    mean_reshaped = reshape(mean_save, (F, 1))
-    
-    # Gradientes para parámetros
+
+    gamma_reshaped = reshape(gamma_data, (1,C,1,1))
+    std_reshaped   = reshape(std_save,  (1,C,1,1))
+    mean_reshaped  = reshape(mean_save, (1,C,1,1))
+
+    # -------- gradientes para gamma y beta ---------------------------
     if layer.gamma.requires_grad
-        grad_gamma = sum(grad_output .* x_norm, dims=2)[:, 1]
-        if grad_gamma isa CUDA.CuArray
-            grad_gamma = Array(grad_gamma)
-        end
-        TensorEngine.backward(layer.gamma, TensorEngine.Tensor(grad_gamma; requires_grad=false))
+        grad_gamma = sum(grad_output .* x_norm, dims=(1,3,4))[1,:,1,1]  # (4D)
+        _accum_grad!(layer.gamma, Array(grad_gamma))
     end
-    
+
     if layer.beta.requires_grad
-        grad_beta = sum(grad_output, dims=2)[:, 1]
-        if grad_beta isa CUDA.CuArray
-            grad_beta = Array(grad_beta)
-        end
-        TensorEngine.backward(layer.beta, TensorEngine.Tensor(grad_beta; requires_grad=false))
+        grad_beta = sum(grad_output, dims=(1,3,4))[1,:,1,1]             # (4D)
+        _accum_grad!(layer.beta, Array(grad_beta))
     end
-    
-    # Gradiente para input
+
+    # -------- gradiente para la entrada (solo si se pide) ------------
+    if input.requires_grad
+        if layer.training
+            M = Float32(N * H * W)
+            grad_xnorm = grad_output .* gamma_reshaped
+            term1 = grad_xnorm ./ std_reshaped
+            term2 = sum(grad_xnorm .* x_norm; dims=(1,3,4)) ./ (M * std_reshaped)
+            term3 = sum(grad_xnorm;            dims=(1,3,4)) .* mean_reshaped ./ (M * std_reshaped)
+            grad_input = term1 .- x_norm .* term2 .- term3
+        else
+            grad_input = (grad_output .* gamma_reshaped) ./ std_reshaped
+        end
+        TensorEngine.backward(input,
+                              TensorEngine.Tensor(grad_input; requires_grad=false))
+    end
+end
+
+
+# ---------------------------------------------------------------------
+# backward mejorado ‑ 2‑D  (F,B)  — para capas Dense
+# ---------------------------------------------------------------------
+function backward_batchnorm_2d_improved!(layer, input, grad_output, x_norm,
+                                         mean_save, std_save, x_save,
+                                         F, B, is_on_gpu)
+
+    gamma_data = layer.gamma.data
+    if is_on_gpu && !(gamma_data isa CUDA.CuArray)
+        gamma_data = CUDA.CuArray(gamma_data)
+    elseif !is_on_gpu &&  (gamma_data isa CUDA.CuArray)
+        gamma_data = Array(gamma_data)
+    end
+
+    gamma_reshaped = reshape(gamma_data, (F,1))
+    std_reshaped   = reshape(std_save,  (F,1))
+    mean_reshaped  = reshape(mean_save, (F,1))
+
+    # -------- gradientes para gamma y beta ---------------------------
+    if layer.gamma.requires_grad
+        grad_gamma = sum(grad_output .* x_norm, dims=2)[:,1]
+        _accum_grad!(layer.gamma, Array(grad_gamma))
+    end
+    if layer.beta.requires_grad
+        grad_beta = sum(grad_output, dims=2)[:,1]
+        _accum_grad!(layer.beta, Array(grad_beta))
+    end
+
+
+    # -------- gradiente para la entrada ------------------------------
     if input.requires_grad
         if layer.training
             M = Float32(B)
             grad_xnorm = grad_output .* gamma_reshaped
-            
             term1 = grad_xnorm ./ std_reshaped
-            term2 = sum(grad_xnorm .* x_norm, dims=2) ./ (M * std_reshaped)
-            term3 = sum(grad_xnorm, dims=2) .* mean_reshaped ./ (M * std_reshaped)
-            
+            term2 = sum(grad_xnorm .* x_norm; dims=2) ./ (M * std_reshaped)
+            term3 = sum(grad_xnorm;            dims=2) .* mean_reshaped ./ (M * std_reshaped)
             grad_input = term1 .- x_norm .* term2 .- term3
         else
             grad_input = (grad_output .* gamma_reshaped) ./ std_reshaped
         end
-        
-        TensorEngine.backward(input, TensorEngine.Tensor(grad_input; requires_grad=false))
+        TensorEngine.backward(input,
+                              TensorEngine.Tensor(grad_input; requires_grad=false))
     end
 end
 
@@ -526,13 +525,13 @@ end
 struct Flatten <: AbstractLayer.Layer end
 
 function (layer::Flatten)(input::TensorEngine.Tensor)
+    # Añadir depuración
+    #println("Flatten - Input shape: ", size(input.data))
+    
     dims = size(input.data)
     @assert length(dims) >= 2 "El tensor de entrada debe tener al menos 2 dimensiones."
     
     is_on_gpu = (input.data isa CUDA.CuArray)
-    
-    # Detección mejorada de formato basada en patrones comunes
-    format = detect_format(dims)
     
     # Caso específico para salida de GlobalAvgPool (batch, channels, 1, 1)
     if length(dims) == 4 && dims[3] == 1 && dims[4] == 1
@@ -540,14 +539,19 @@ function (layer::Flatten)(input::TensorEngine.Tensor)
         channels = dims[2]
         
         if is_on_gpu
+            # En GPU, usar funciones específicas de CUDA
             reshaped = CUDA.reshape(input.data, (batch_size, channels))
             new_data = CUDA.permutedims(reshaped, (2, 1))  # (channels, batch)
         else
+            # En CPU
             reshaped = reshape(input.data, (batch_size, channels))
             new_data = permutedims(reshaped, (2, 1))  # (channels, batch)
         end
     else
-        if format == :NCHW
+        # Detectar el formato NCHW vs WHCN para otros casos
+        is_nchw = (length(dims) == 4 && dims[1] <= 64)
+        
+        if is_nchw
             # Formato NCHW: (batch, canales, alto, ancho)
             n = dims[1]
             flat_dim = prod(dims[2:end])
@@ -560,7 +564,7 @@ function (layer::Flatten)(input::TensorEngine.Tensor)
                 reshaped = reshape(input.data, (n, flat_dim))
                 new_data = permutedims(reshaped, (2, 1))
             end
-        else  # format == :WHCN
+        else
             # Formato WHCN (original): (W, H, C, N)
             flat_dim = prod(dims[1:end-1])
             batch_dim = dims[end]
@@ -574,50 +578,60 @@ function (layer::Flatten)(input::TensorEngine.Tensor)
         end
     end
     
-    out = TensorEngine.Tensor(new_data)
+    #println("Flatten - Output shape: ", size(new_data))
     
-    # Implementación mejorada de backward
-    out.backward_fn = grad -> begin
-        grad_data = grad
-        
-        # Asegurar mismo dispositivo que input
-        if (grad_data isa CUDA.CuArray) != is_on_gpu
-            if is_on_gpu
-                grad_data = CUDA.CuArray(grad_data)
-            else
-                grad_data = Array(grad_data)
-            end
-        end
-        
-        # Restaurar forma original según el caso
-        if length(dims) == 4 && dims[3] == 1 && dims[4] == 1
-            batch_size = dims[1]
-            channels = dims[2]
+    # CAMBIO CRÍTICO: Propagar requires_grad
+    out = TensorEngine.Tensor(new_data; requires_grad=input.requires_grad)
+    
+    # Nueva implementación segura para backward
+    if out.requires_grad
+        out.backward_fn = grad -> begin
+            # Obtener datos del gradiente
+            grad_data = grad
             
-            if is_on_gpu
-                grad_reshaped = CUDA.permutedims(grad_data, (2, 1))
-                restored = CUDA.reshape(grad_reshaped, (batch_size, channels, 1, 1))
-            else
-                grad_reshaped = permutedims(grad_data, (2, 1))
-                restored = reshape(grad_reshaped, (batch_size, channels, 1, 1))
+            # Convertir a mismo tipo y dispositivo que input
+            if (grad_data isa CUDA.CuArray) != is_on_gpu
+                if is_on_gpu
+                    grad_data = CUDA.CuArray(grad_data)
+                else
+                    grad_data = Array(grad_data)
+                end
             end
-        elseif format == :NCHW
-            if is_on_gpu
-                grad_reshaped = CUDA.permutedims(grad_data, (2, 1))
-                restored = CUDA.reshape(grad_reshaped, dims)
+            
+            # Caso especial para salida de GlobalAvgPool
+            if length(dims) == 4 && dims[3] == 1 && dims[4] == 1
+                batch_size = dims[1]
+                channels = dims[2]
+                
+                if is_on_gpu
+                    grad_reshaped = CUDA.permutedims(grad_data, (2, 1))  # (batch, channels)
+                    restored = CUDA.reshape(grad_reshaped, (batch_size, channels, 1, 1))
+                else
+                    grad_reshaped = permutedims(grad_data, (2, 1))  # (batch, channels)
+                    restored = reshape(grad_reshaped, (batch_size, channels, 1, 1))
+                end
+            elseif is_nchw
+                # Para formato NCHW, necesitamos deshacer las operaciones
+                if is_on_gpu
+                    # En GPU, manejar con cuidado
+                    grad_reshaped = CUDA.permutedims(grad_data, (2, 1))  # (n, flat_dim)
+                    restored = CUDA.reshape(grad_reshaped, dims)  # Restaurar a forma original
+                else
+                    # En CPU
+                    grad_reshaped = permutedims(grad_data, (2, 1))  # (n, flat_dim)
+                    restored = reshape(grad_reshaped, dims)  # Restaurar a forma original
+                end
             else
-                grad_reshaped = permutedims(grad_data, (2, 1))
-                restored = reshape(grad_reshaped, dims)
+                # Para formato WHCN (original)
+                if is_on_gpu
+                    restored = CUDA.reshape(grad_data, dims)  # Restaurar a forma original
+                else
+                    restored = reshape(grad_data, dims)  # Restaurar a forma original
+                end
             end
-        else  # format == :WHCN
-            if is_on_gpu
-                restored = CUDA.reshape(grad_data, dims)
-            else
-                restored = reshape(grad_data, dims)
-            end
+            
+            TensorEngine.backward(input, TensorEngine.Tensor(restored))
         end
-        
-        TensorEngine.backward(input, TensorEngine.Tensor(restored))
     end
     
     return out

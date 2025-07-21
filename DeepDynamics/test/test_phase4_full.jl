@@ -265,8 +265,8 @@ println("TEST DE INTEGRACIÓN FINAL")
 
 
 @testset "Integración CNN con BatchNorm" begin
-    # Crear un modelo CNN simple
-    model = Sequential([
+    # Primero las capas convolucionales
+    conv_layers = [
         Conv2D(3, 16, (3,3), padding=(1,1)),
         BatchNorm(16),
         Activation(relu),
@@ -275,8 +275,21 @@ println("TEST DE INTEGRACIÓN FINAL")
         BatchNorm(32),
         Activation(relu),
         MaxPooling((2,2)),
-        Flatten(),
-        Dense(32*16*16, 64),
+        Flatten()
+    ]
+    
+    # Calcular dimensión después de Flatten
+    dummy_input = Tensor(randn(Float32, 4, 3, 64, 64))
+    x = dummy_input
+    for layer in conv_layers
+        x = layer(x)
+    end
+    flat_dim = size(x.data, 1)
+    
+    # Crear modelo completo
+    model = Sequential([
+        conv_layers...,
+        Dense(flat_dim, 64),    # Dimensión calculada → 64
         BatchNorm(64),
         Activation(relu),
         Dense(64, 10),
@@ -284,7 +297,7 @@ println("TEST DE INTEGRACIÓN FINAL")
     ])
     
     # Datos de entrada
-    X = Tensor(randn(Float32, 4, 3, 64, 64))  # 4 imágenes de 64x64x3
+    X = Tensor(randn(Float32, 4, 3, 64, 64))
     
     # Forward pass
     output = model(X)
@@ -321,7 +334,7 @@ println("TEST DE INTEGRACIÓN FINAL")
         end
     end
     
-    @test bn_count == 3  # Deberíamos tener 3 BatchNorm layers
+    @test bn_count == 3
     
     println("✅ Integración completa exitosa")
 end

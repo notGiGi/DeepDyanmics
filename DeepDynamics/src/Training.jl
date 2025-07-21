@@ -142,7 +142,7 @@ function stack_batch(batch::Vector{<:TensorEngine.Tensor})
             return TensorEngine.Tensor(stacked)
         end
         
-    elseif nd == 4  # Tensores 4D
+    elseif nd == 4  #Tensores 4D
         # Determinar formato inspeccionando dimensiones
         first_dims = size(first_tensor.data)
         
