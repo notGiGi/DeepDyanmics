@@ -1,49 +1,43 @@
 module Models
 
 using ..NeuralNetwork
-using ..ConvKernelLayers
-using ..Layers
 using ..ConvolutionalLayers
+using ..Layers
 using ..AbstractLayer
 export create_resnet, create_simple_cnn
 
 """
 Crea un modelo ResNet con el número especificado de bloques y clases
 """
-# En Models.jl - Versión corregida de create_resnet con debugging
 function create_resnet(input_channels=3, num_classes=2; blocks=[2,2,2,2])
     layers = AbstractLayer.Layer[]
     
-    # Imprimimos información de depuración
+    # Debug
     println("Creating ResNet with input channels: $input_channels")
     
-    # Capa de entrada - siempre debe tener el número correcto de canales de entrada
+    # Capa de entrada
     initial_channels = 64
     println("Initial conv: $input_channels -> $initial_channels")
-    push!(layers, ConvKernelLayer(input_channels, initial_channels, (7,7), stride=(2,2), padding=(3,3)))
+    push!(layers, Conv2D(input_channels, initial_channels, (7,7), stride=(2,2), padding=(3,3)))
     push!(layers, BatchNorm(initial_channels))
     push!(layers, LayerActivation(relu))
     push!(layers, MaxPooling((3,3), stride=(2,2), padding=(1,1)))
     
-    # Bloques residuales - hacemos un seguimiento de los canales entre bloques
+    # Bloques residuales
     in_channels = initial_channels
     for (i, block_count) in enumerate(blocks)
         out_channels = initial_channels * (2^(i-1))
-        
         println("Block section $i: $in_channels -> $out_channels")
         
-        # Primer bloque puede tener stride para reducir dimensiones
         stride = i > 1 ? 2 : 1
         println("  First block: stride=$stride")
         push!(layers, create_residual_block(in_channels, out_channels, stride))
         
-        # Resto de bloques en esta sección mantienen dimensiones
         for j in 2:block_count
             println("  Block $j: $out_channels -> $out_channels")
             push!(layers, create_residual_block(out_channels, out_channels, 1))
         end
         
-        # Actualizar canales para la siguiente sección
         in_channels = out_channels
     end
     
@@ -58,19 +52,17 @@ function create_resnet(input_channels=3, num_classes=2; blocks=[2,2,2,2])
     return Sequential(layers)
 end
 
-
-
 """
 Crea un modelo CNN simple para clasificación
 """
 function create_simple_cnn(input_channels=3, num_classes=2)
     return Sequential([
-        ConvKernelLayer(input_channels, 32, (3,3), stride=(1,1), padding=(1,1)),
+        Conv2D(input_channels, 32, (3,3), stride=(1,1), padding=(1,1)),
         BatchNorm(32),
         NeuralNetwork.Activation(relu),
         MaxPooling((2,2)),
         
-        ConvKernelLayer(32, 64, (3,3), stride=(1,1), padding=(1,1)),
+        Conv2D(32, 64, (3,3), stride=(1,1), padding=(1,1)),
         BatchNorm(64),
         NeuralNetwork.Activation(relu),
         MaxPooling((2,2)),

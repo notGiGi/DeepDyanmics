@@ -1,6 +1,6 @@
 module Layers
 
-using NNlib, CUDA, ..TensorEngine, ..AbstractLayer, ..ConvKernelLayers, Statistics
+using NNlib, CUDA, ..TensorEngine, ..AbstractLayer, ..ConvKernelLayers, Statistics, ..ConvolutionalLayers
 export BatchNorm, Flatten, LayerActivation, set_training!, reset_running_stats!, GlobalAvgPool, ResidualBlock, create_residual_block, CustomFlatten, DropoutLayer
 # Añadir en Layers.jl justo antes del end del módulo
 
@@ -819,17 +819,16 @@ end
 # Función auxiliar para crear bloques residuales
 function create_residual_block(in_channels, out_channels, stride=1)
     conv_path = AbstractLayer.Layer[
-        ConvKernelLayer(in_channels, out_channels, (3,3), stride=(stride,stride), padding=(1,1)),
+        Conv2D(in_channels, out_channels, (3,3); stride=(stride,stride), padding=(1,1)),
         BatchNorm(out_channels),
-        LayerActivation(relu),  # Usar LayerActivation en lugar de Activation
-        ConvKernelLayer(out_channels, out_channels, (3,3), stride=(1,1), padding=(1,1)),
+        LayerActivation(relu),
+        Conv2D(out_channels, out_channels, (3,3); stride=(1,1), padding=(1,1)),
         BatchNorm(out_channels)
     ]
     
     if stride != 1 || in_channels != out_channels
-        # Si hay cambio de dimensión, necesitamos proyección en el shortcut
         shortcut = AbstractLayer.Layer[
-            ConvKernelLayer(in_channels, out_channels, (1,1), stride=(stride,stride), padding=(0,0)),
+            Conv2D(in_channels, out_channels, (1,1); stride=(stride,stride), padding=(0,0)),
             BatchNorm(out_channels)
         ]
     else
@@ -838,6 +837,7 @@ function create_residual_block(in_channels, out_channels, stride=1)
     
     return ResidualBlock(conv_path, shortcut)
 end
+
 
 
 

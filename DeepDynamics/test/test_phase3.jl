@@ -7,11 +7,12 @@ println("=== TEST FASE 3: Capas Fundamentales (CORREGIDO) ===")
 
 @testset "FASE 3 - Capas Fundamentales" begin
     # Test 3.1: Dense verifica dimensiones
-    @test_throws AssertionError begin
+    @test_throws Union{AssertionError, ErrorException} begin
         layer = Dense(10, 5)
         wrong_input = Tensor(randn(Float32, 8, 2))  # 8 != 10
         layer(wrong_input)
     end
+
     println("✓ Dense rechaza dimensiones incorrectas")
     
     # Test 3.2: Flatten detecta formatos

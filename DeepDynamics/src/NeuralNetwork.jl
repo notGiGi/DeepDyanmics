@@ -11,8 +11,11 @@ using CUDA
 using LinearAlgebra
 using ..ReshapeModule: Reshape  # Importar Reshape desde ReshapeModule
 using ..ConvKernelLayers
-export Sequential, Dense, collect_parameters, relu, sigmoid, tanh_activation,
-       leaky_relu, swish, mish, softmax, Activation
+export Sequential, Dense, Activation, collect_parameters,
+       relu, softmax, sigmoid, tanh_activation, leaky_relu,
+       model_to_gpu, model_to_cpu, model_device, model_to_device,
+       layer_to_device, forward
+
 
 # ==================================================================
 # Capa Dense Optimizada (Sin activación integrada)
@@ -30,78 +33,36 @@ function Dense(input_size::Int, output_size::Int; init_method::Symbol=:xavier)
 end
 
 function forward(layer::Dense, input::TensorEngine.Tensor)
-    # Verificar dimensiones de entrada
-    expected_input_size = size(layer.weights.data, 2)
-    actual_input_size = size(input.data, 1)
-    
-    @assert actual_input_size == expected_input_size "Dense layer expects input size $expected_input_size but got $actual_input_size"
-    
-    # Obtener datos
-    W = layer.weights.data
+    # Asegurar que datos están en el mismo dispositivo
+    W = TensorEngine.ensure_on_device(layer.weights.data, TensorEngine.device_of(input))
+    b = TensorEngine.ensure_on_device(layer.biases.data, TensorEngine.device_of(input))
     x = input.data
-    
-    # Detectar si estamos trabajando en GPU o CPU
-    w_on_gpu = (W isa CUDA.CuArray)
-    x_on_gpu = (x isa CUDA.CuArray)
-    
-    # Asegurar que W y x estén en el mismo dispositivo
-    if w_on_gpu && !x_on_gpu
-        x = CUDA.CuArray(x)
-        x_on_gpu = true
-    elseif !w_on_gpu && x_on_gpu
-        W = CUDA.CuArray(W)
-        w_on_gpu = true
+
+    # Verificar dimensiones: (input_size, batch_size)
+    if size(x, 1) != size(W, 2)
+        error("Dense layer expects input size $(size(W, 2)), got $(size(x, 1))")
     end
-    
-    # Realizar la multiplicación de matrices
-    output = W * x
-    
-    # Obtener el bias y asegurar que esté en el mismo dispositivo
-    b = layer.biases.data
-    b_on_gpu = (b isa CUDA.CuArray)
-    
-    if b_on_gpu != x_on_gpu
-        if x_on_gpu
-            b = CUDA.CuArray(b)
-        else
-            b = Array(b)
-        end
-    end
-    
-    # Añadir el bias
-    # reshape para asegurar broadcasteo correcto
-    output = output .+ reshape(b, :, 1)
-    
+
+    # Calcular salida: W * x + b
+    output = W * x .+ reshape(b, :, 1)
+
     # Crear tensor de salida
-    out_tensor = TensorEngine.Tensor(output)
-    
-    # Definir la función backward
+    out_tensor = TensorEngine.Tensor(output, requires_grad=input.requires_grad || layer.weights.requires_grad)
+
+    # Definir backward
     out_tensor.backward_fn = function(grad)
-        # Asegurar que el gradiente está en el mismo dispositivo
-        grad_on_gpu = (grad isa CUDA.CuArray)
-        grad_data = grad
-        
-        if grad_on_gpu != x_on_gpu
-            if x_on_gpu
-                grad_data = CUDA.CuArray(grad_data)
-            else
-                grad_data = Array(grad_data)
-            end
-        end
-        
-        # Calcular gradientes
-        ∇W = grad_data * x'
-        ∇b = sum(grad_data, dims=2)
-        ∇x = W' * grad_data
-        
-        # Propagar gradientes
+        ∇W = grad * x'
+        ∇b = sum(grad, dims=2)
+        ∇x = W' * grad
+
         TensorEngine.backward(layer.weights, TensorEngine.Tensor(∇W))
         TensorEngine.backward(layer.biases, TensorEngine.Tensor(∇b))
         TensorEngine.backward(input, TensorEngine.Tensor(∇x))
     end
-    
+
     return out_tensor
 end
+
 
 function (layer::Dense)(input::TensorEngine.Tensor)
     return forward(layer, input)
@@ -114,18 +75,34 @@ struct Sequential <: AbstractLayer.Layer
     layers::Vector{AbstractLayer.Layer}
 end
 
-function forward(model::Sequential, input::TensorEngine.Tensor; verbose::Bool=false)
+function forward(model::Sequential, input::Tensor; verbose::Bool=false)
     current = input
     for (i, layer) in enumerate(model.layers)
-        current = layer(current)
-        verbose && @info "Layer $i output size: $(size(current.data))"
+        # Ejecutar la capa
+        out = layer(current)
+
+        # Validar salida
+        if out isa Tensor
+            current = out
+        elseif out isa AbstractArray
+            current = Tensor(out; requires_grad=current.requires_grad)
+        else
+            error("Layer $i returned unsupported type $(typeof(out))")
+        end
+
+        verbose && @info "Layer $i output size: $(size(current.data)) device: $(device_of(current))"
     end
     return current
 end
 
-function (model::Sequential)(input::TensorEngine.Tensor)
-    return forward(model, input)
-end
+# Sobrecarga de llamada para que funcione model(input)
+(model::Sequential)(input::Tensor) = forward(model, input)
+
+
+
+(model::Sequential)(input) = forward(model, input)
+
+
 
 # ==================================================================
 # Capa de Activación (corregida)
@@ -266,184 +243,181 @@ end
 # ==================================================================
 # Funciones de Ayuda
 # ==================================================================
+"""
+    model_to_device(model::Sequential, device::Symbol) -> Sequential
+
+Devuelve una copia del modelo con todos sus parámetros movidos al dispositivo especificado (:gpu o :cpu).
+"""
+function model_to_device(model::Sequential, device::Symbol)
+    layers_new = [layer_to_device(layer, device) for layer in model.layers]
+    return Sequential(layers_new)
+end
+
+"""
+    model_to_gpu(model::Sequential) -> Sequential
+
+Devuelve una copia del modelo en GPU. Si CUDA no está disponible, devuelve el modelo original.
+"""
+function model_to_gpu(model::Sequential)
+    if !CUDA.functional()
+        @warn "CUDA no está disponible. El modelo se mantiene en CPU."
+        return model
+    end
+    return model_to_device(model, :gpu)
+end
+
+"""
+    model_to_cpu(model::Sequential) -> Sequential
+
+Devuelve una copia del modelo en CPU.
+"""
+function model_to_cpu(model::Sequential)
+    return model_to_device(model, :cpu)
+end
+
+"""
+    model_device(model::Sequential) -> Symbol
+
+Detecta en qué dispositivo está el modelo (basado en su primer parámetro encontrado).
+"""
+function model_device(model::Sequential)
+    params = collect_parameters(model)
+    if isempty(params)
+        return :cpu  # Si no hay parámetros asumimos CPU
+    end
+    return TensorEngine.device_of(params[1])
+end
+
+"""
+    collect_parameters(model::Sequential) -> Vector{Tensor}
+
+Devuelve todos los tensores entrenables del modelo (pesos y bias).
+"""
 function collect_parameters(model::Sequential)
     params = TensorEngine.Tensor[]
     for layer in model.layers
-        if layer isa Dense
-            push!(params, layer.weights, layer.biases)
-        elseif layer isa Layers.BatchNorm  # Usar namespace completo
-            push!(params, layer.gamma, layer.beta)
-        elseif layer isa ConvKernelLayers.ConvKernelLayer
-            # Verificar si ya son Tensors antes de convertir
-            if layer.weights isa TensorEngine.Tensor
-                push!(params, layer.weights)
-            else
-                push!(params, TensorEngine.Tensor(layer.weights))
-            end
-            if layer.bias isa TensorEngine.Tensor
-                push!(params, layer.bias)
-            else
-                push!(params, TensorEngine.Tensor(layer.bias))
-            end
-        elseif layer isa ConvolutionalLayers.Conv2D
-            push!(params, layer.weights, layer.bias)
-            if layer.use_batchnorm && layer.gamma !== nothing
-                push!(params, layer.gamma, layer.beta)
-            end
-        elseif layer isa Layers.ResidualBlock
-            # Recolectar parámetros de bloques residuales recursivamente
-            for sublayer in layer.conv_path
-                append!(params, collect_parameters(Sequential([sublayer])))
-            end
-            for sublayer in layer.shortcut
-                append!(params, collect_parameters(Sequential([sublayer])))
-            end
-        end
-        # Activation, Flatten, MaxPooling, etc. no tienen parámetros
+        append!(params, collect_layer_parameters(layer))
     end
     return params
 end
 
 """
-    model_to_gpu(model::Sequential) → Sequential
+    collect_layer_parameters(layer) -> Vector{Tensor}
 
-Crea una copia del `Sequential` donde **todos los tensores que
-requieren gradiente** pasan a `CuArray`, preservando su bandera
-`requires_grad`.  
-Los tensores que no requieren gradiente se copian igualmente para que
-estén en la GPU (por coherencia de dispositivo), pero con
-`requires_grad = false`.
+Devuelve todos los tensores entrenables de una capa individual.
 """
-function model_to_gpu(model::Sequential)
-    layers_gpu = Vector{AbstractLayer.Layer}()
-
-    for layer in model.layers
-        ##################################################################
-        # 1. Dense
-        ##################################################################
-        if layer isa Dense
-            Wg = TensorEngine.Tensor(
-                     CUDA.CuArray(layer.weights.data);
-                     requires_grad = layer.weights.requires_grad)
-
-            bg = TensorEngine.Tensor(
-                     CUDA.CuArray(layer.biases.data);
-                     requires_grad = layer.biases.requires_grad)
-
-            push!(layers_gpu, Dense(Wg, bg))
-
-        ##################################################################
-        # 2. Conv2D  (con o sin BatchNorm interno)
-        ##################################################################
-        elseif layer isa ConvolutionalLayers.Conv2D
-            Wg = TensorEngine.Tensor(
-                     CUDA.CuArray(layer.weights.data);
-                     requires_grad = layer.weights.requires_grad)
-
-            bg = TensorEngine.Tensor(
-                     CUDA.CuArray(layer.bias.data);
-                     requires_grad = layer.bias.requires_grad)
-
-            γg = layer.use_batchnorm && layer.gamma !== nothing ?
-                     TensorEngine.Tensor(
-                         CUDA.CuArray(layer.gamma.data);
-                         requires_grad = layer.gamma.requires_grad) : nothing
-
-            βg = layer.use_batchnorm && layer.beta  !== nothing ?
-                     TensorEngine.Tensor(
-                         CUDA.CuArray(layer.beta.data);
-                         requires_grad = layer.beta.requires_grad)  : nothing
-
-            new_conv = ConvolutionalLayers.Conv2D(
-                           Wg, bg, layer.stride, layer.padding,
-                           layer.use_batchnorm, γg, βg)
-
-            push!(layers_gpu, new_conv)
-
-        ##################################################################
-        # 3. ConvKernelLayer
-        ##################################################################
-        elseif layer isa ConvKernelLayers.ConvKernelLayer
-            new_conv = ConvKernelLayers.ConvKernelLayer(
-                           layer.in_channels, layer.out_channels, layer.kernel_size,
-                           layer.stride, layer.padding,
-                           TensorEngine.Tensor(
-                               CUDA.CuArray(layer.weights.data);
-                               requires_grad = layer.weights.requires_grad),
-                           TensorEngine.Tensor(
-                               CUDA.CuArray(layer.bias.data);
-                               requires_grad = layer.bias.requires_grad),
-                           TensorEngine.Tensor(
-                               CUDA.CuArray(layer.gradW.data); requires_grad = false),
-                           TensorEngine.Tensor(
-                               CUDA.CuArray(layer.gradB.data); requires_grad = false))
-            push!(layers_gpu, new_conv)
-
-        ##################################################################
-        # 4. BatchNorm
-        ##################################################################
-        elseif layer isa Layers.BatchNorm
-            ch = length(layer.gamma.data)
-            new_bn = Layers.BatchNorm(ch;
-                                      momentum = layer.momentum,
-                                      epsilon  = layer.epsilon,
-                                      training = layer.training)
-
-            #  ── copiar parámetros conservando requires_grad ────────────
-            new_bn.gamma = TensorEngine.Tensor(
-                               CUDA.CuArray(layer.gamma.data);
-                               requires_grad = layer.gamma.requires_grad)
-
-            new_bn.beta  = TensorEngine.Tensor(
-                               CUDA.CuArray(layer.beta.data);
-                               requires_grad = layer.beta.requires_grad)
-
-            # running stats (buffers) siguen en CPU
-            new_bn.running_mean .= layer.running_mean
-            new_bn.running_var  .= layer.running_var
-            new_bn.num_batches_tracked = layer.num_batches_tracked
-
-            push!(layers_gpu, new_bn)
-
-        ##################################################################
-        # 5. Bloques residuales  (procesar recursivamente)
-        ##################################################################
-        elseif layer isa Layers.ResidualBlock
-            conv_path_gpu = AbstractLayer.Layer[]
-            for sub in layer.conv_path
-                push!(conv_path_gpu,
-                      model_to_gpu(Sequential([sub])).layers[1])
+function collect_layer_parameters(layer)
+    params = TensorEngine.Tensor[]
+    
+    if layer isa Dense
+        for p in (layer.weights, layer.biases)
+            push!(params, p isa Tensor ? p : Tensor(p; requires_grad=true))
+        end
+    elseif layer isa Layers.BatchNorm
+        for p in (layer.gamma, layer.beta)
+            push!(params, p isa Tensor ? p : Tensor(p; requires_grad=true))
+        end
+    elseif layer isa ConvolutionalLayers.Conv2D
+        for p in (layer.weights, layer.bias)
+            push!(params, p isa Tensor ? p : Tensor(p; requires_grad=true))
+        end
+        if layer.use_batchnorm && layer.gamma !== nothing
+            for p in (layer.gamma, layer.beta)
+                push!(params, p isa Tensor ? p : Tensor(p; requires_grad=true))
             end
-
-            shortcut_gpu = AbstractLayer.Layer[]
-            for sub in layer.shortcut
-                push!(shortcut_gpu,
-                      model_to_gpu(Sequential([sub])).layers[1])
-            end
-
-            push!(layers_gpu, Layers.ResidualBlock(conv_path_gpu, shortcut_gpu))
-
-        ##################################################################
-        # 6. Capas sin parámetros (se copian tal cual)
-        ##################################################################
-        elseif layer isa ConvolutionalLayers.MaxPooling ||
-               layer isa GlobalAvgPool                    ||
-               layer isa Flatten                          ||
-               layer isa Reshape                          ||
-               layer isa Layers.DropoutLayer              ||
-               layer isa Activation                       ||
-               layer isa Layers.LayerActivation
-            push!(layers_gpu, layer)
-
-        ##################################################################
-        # 7. Tipo desconocido
-        ##################################################################
-        else
-            error("Tipo de capa no soportado en model_to_gpu: $(typeof(layer))")
+        end
+    elseif layer isa ConvKernelLayers.ConvKernelLayer
+        for p in (layer.weights, layer.bias)
+            push!(params, p isa Tensor ? p : Tensor(p; requires_grad=true))
+        end
+    elseif layer isa EmbeddingLayer.Embedding
+        p = layer.weights
+        push!(params, p isa Tensor ? p : Tensor(p; requires_grad=true))
+    elseif layer isa Layers.ResidualBlock
+        for sub in layer.conv_path
+            append!(params, collect_layer_parameters(sub))
+        end
+        for sub in layer.shortcut
+            append!(params, collect_layer_parameters(sub))
         end
     end
+    
+    return params
+end
 
-    return Sequential(layers_gpu)
+
+"""
+    layer_to_device(layer, device::Symbol)
+
+Mueve una capa individual al dispositivo especificado.
+"""
+function layer_to_device(layer::Dense, device::Symbol)
+    weights_new = TensorEngine.ensure_on_device(layer.weights, device)
+    biases_new  = TensorEngine.ensure_on_device(layer.biases, device)
+    return Dense(weights_new, biases_new)
+end
+
+function layer_to_device(layer::Layers.BatchNorm, device::Symbol)
+    ch = length(layer.gamma.data)
+    bn_new = Layers.BatchNorm(
+        ch; momentum=layer.momentum,
+            epsilon=layer.epsilon,
+            training=layer.training
+    )
+    bn_new.gamma = TensorEngine.ensure_on_device(layer.gamma, device)
+    bn_new.beta  = TensorEngine.ensure_on_device(layer.beta, device)
+    bn_new.running_mean .= layer.running_mean
+    bn_new.running_var  .= layer.running_var
+    bn_new.num_batches_tracked = layer.num_batches_tracked
+    return bn_new
+end
+
+function layer_to_device(layer::ConvolutionalLayers.Conv2D, device::Symbol)
+    weights_new = TensorEngine.ensure_on_device(layer.weights, device)
+    bias_new    = TensorEngine.ensure_on_device(layer.bias, device)
+    gamma_new   = layer.gamma !== nothing ? 
+                  TensorEngine.ensure_on_device(layer.gamma, device) : nothing
+    beta_new    = layer.beta  !== nothing ? 
+                  TensorEngine.ensure_on_device(layer.beta, device)  : nothing
+    return ConvolutionalLayers.Conv2D(
+        weights_new, bias_new, layer.stride, layer.padding,
+        layer.use_batchnorm, gamma_new, beta_new
+    )
+end
+
+function layer_to_device(layer::ConvKernelLayers.ConvKernelLayer, device::Symbol)
+    weights_new = TensorEngine.ensure_on_device(layer.weights, device)
+    bias_new    = TensorEngine.ensure_on_device(layer.bias, device)
+    gradW_new   = TensorEngine.ensure_on_device(layer.gradW, device)
+    gradB_new   = TensorEngine.ensure_on_device(layer.gradB, device)
+    return ConvKernelLayers.ConvKernelLayer(
+        layer.in_channels, layer.out_channels, layer.kernel_size,
+        layer.stride, layer.padding,
+        weights_new, bias_new, gradW_new, gradB_new
+    )
+end
+
+function layer_to_device(layer::ResidualBlock, device::Symbol)
+    conv_path_new = Vector{AbstractLayer.Layer}()
+    for sublayer in layer.conv_path
+        push!(conv_path_new, layer_to_device(sublayer, device))
+    end
+
+    shortcut_new = Vector{AbstractLayer.Layer}()
+    for sublayer in layer.shortcut
+        push!(shortcut_new, layer_to_device(sublayer, device))
+    end
+
+    return ResidualBlock(conv_path_new, shortcut_new)
+end
+
+
+
+
+
+function layer_to_device(layer, device::Symbol)
+    # Capas sin parámetros (Flatten, Activation, Dropout, etc.)
+    return layer
 end
 
 

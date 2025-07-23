@@ -1,7 +1,7 @@
 module GPUMemoryManager
 
 using CUDA
-export get_tensor_buffer, release_tensor_buffer, clear_cache, print_cache_stats
+export get_tensor_buffer, release_tensor_buffer, clear_cache, print_cache_stats, memory_stats
 
 # Caché para tensores, organizada por tamaño y tipo
 const TENSOR_CACHE = Dict{Tuple{Int, DataType}, Vector{CuArray}}()
@@ -20,16 +20,18 @@ Obtiene un buffer GPU del tamaño y tipo especificados, reutilizando del caché 
 """
 function get_tensor_buffer(shape, type=Float32)
     key = (prod(shape), type)
-    
-    if haskey(TENSOR_CACHE, key) && !isempty(TENSOR_CACHE[key])
-        buffer = pop!(TENSOR_CACHE[key])
-        CACHE_STATS[:hits] += 1
-        
-        # Asegurarse que tenga la forma correcta (puede ser diferente pero mismo tamaño total)
-        return reshape(buffer, shape)
-    else
-        CACHE_STATS[:misses] += 1
-        return CUDA.zeros(type, shape)
+    try
+        if haskey(TENSOR_CACHE, key) && !isempty(TENSOR_CACHE[key])
+            buffer = pop!(TENSOR_CACHE[key])
+            CACHE_STATS[:hits] += 1
+            return reshape(buffer, shape)
+        else
+            CACHE_STATS[:misses] += 1
+            return CUDA.zeros(type, shape)
+        end
+    catch e
+        @warn "Failed to allocate GPU buffer: $e. Returning empty array."
+        return CUDA.zeros(type, 0, 0, 0, 0)
     end
 end
 
@@ -38,30 +40,35 @@ end
 
 Devuelve un buffer al caché para reutilización futura.
 """
-function release_tensor_buffer(buffer)
-    key = (length(buffer), eltype(buffer))
-    
-    if !haskey(TENSOR_CACHE, key)
-        TENSOR_CACHE[key] = CuArray[]
+function release_tensor_buffer(buffer::CuArray)
+    try
+        key = (length(buffer), eltype(buffer))
+        if !haskey(TENSOR_CACHE, key)
+            TENSOR_CACHE[key] = CuArray[]
+        end
+        push!(TENSOR_CACHE[key], buffer)
+        CACHE_STATS[:releases] += 1
+    catch e
+        @warn "Failed to release GPU buffer: $e"
     end
-    
-    push!(TENSOR_CACHE[key], buffer)
-    CACHE_STATS[:releases] += 1
 end
 
 """
     clear_cache()
 
-Libera toda la memoria almacenada en caché.
+Libera toda la memoria almacenada en caché y fuerza limpieza del pool de CUDA.
 """
 function clear_cache()
-    empty!(TENSOR_CACHE)
-    GC.gc()
-    CUDA.reclaim()
-    
-    # Reiniciar estadísticas
-    for key in keys(CACHE_STATS)
-        CACHE_STATS[key] = 0
+    try
+        empty!(TENSOR_CACHE)
+        GC.gc()
+        CUDA.reclaim()
+        for key in keys(CACHE_STATS)
+            CACHE_STATS[key] = 0
+        end
+        @info "GPU memory cache cleared"
+    catch e
+        @warn "Failed to clear GPU cache: $e"
     end
 end
 
@@ -77,20 +84,44 @@ function print_cache_stats()
     for ((size, type), buffers) in TENSOR_CACHE
         count = length(buffers)
         bytes = size * sizeof(type) * count
-        
         counts[type] = get(counts, type, 0) + count
         total_bytes += bytes
     end
     
-    println("=== Estadísticas de Caché GPU ===")
-    println("Total en caché: $(round(total_bytes/1024^2, digits=2)) MB")
-    println("Buffers por tipo:")
+    println("=== GPU Cache Stats ===")
+    println("Total cached: $(round(total_bytes / 1024^2, digits=2)) MB")
     for (type, count) in counts
         println("  $type: $count buffers")
     end
-    println("Accesos: $(CACHE_STATS[:hits]) hits, $(CACHE_STATS[:misses]) misses")
-    println("Relación hit/miss: $(round(CACHE_STATS[:hits]/(CACHE_STATS[:misses] + 1), digits=2))")
-    println("Liberaciones: $(CACHE_STATS[:releases])")
+    println("Cache hits: $(CACHE_STATS[:hits])  misses: $(CACHE_STATS[:misses])  releases: $(CACHE_STATS[:releases])")
+end
+
+"""
+    memory_stats()
+
+Devuelve un resumen del estado actual de la memoria GPU.
+"""
+function memory_stats()
+    try
+        total_mem = CUDA.totalmem() / 1e9
+        used_mem = CUDA.memory_used() / 1e9
+        free_mem = total_mem - used_mem
+        free_percent = 100 * free_mem / total_mem
+        return (
+            total = total_mem,
+            used = used_mem,
+            free = free_mem,
+            free_percent = free_percent
+        )
+    catch e
+        @warn "Could not fetch GPU memory stats: $e. Returning zeros."
+        return (
+            total = 0.0,
+            used = 0.0,
+            free = 0.0,
+            free_percent = 0.0
+        )
+    end
 end
 
 end # module
