@@ -49,23 +49,32 @@ function binary_crossentropy(y_pred::TensorEngine.Tensor, y_true::TensorEngine.T
     
     result = TensorEngine.Tensor(result_data)
     
-    # Función backward con compatibilidad GPU/CPU y consistencia de tipos
-    result.backward_fn = grad -> begin
-        # Asegurar que grad tiene el tipo correcto
-        grad_val = convert(data_type, grad)
-        
-        # Calcular gradiente
-        dLdp = -(y_true_data[1,1] / p - (1 - y_true_data[1,1]) / (1 - p))
-        
-        # Preparar el tensor de gradiente en el dispositivo y tipo correctos
-        if is_on_gpu
-            grad_tensor = TensorEngine.Tensor(CUDA.fill(grad_val * dLdp, size(y_pred_data)))
-        else
-            grad_tensor = TensorEngine.Tensor(reshape([grad_val * dLdp], size(y_pred_data)))
+    # Solo asignar backward_fn si y_pred requiere gradientes
+    if y_pred.requires_grad
+        result.backward_fn = grad -> begin
+            # Manejar tanto escalares como arrays
+            grad_val = if grad isa AbstractArray
+                length(grad) == 1 ? grad[1] : error("Gradiente debe ser escalar")
+            else
+                grad
+            end
+            
+            # Asegurar que grad_val tiene el tipo correcto
+            grad_val = convert(data_type, grad_val)
+            
+            # Calcular gradiente
+            dLdp = -(y_true_data[1,1] / p - (1 - y_true_data[1,1]) / (1 - p))
+            
+            # Preparar el tensor de gradiente en el dispositivo y tipo correctos
+            if is_on_gpu
+                grad_tensor = TensorEngine.Tensor(CUDA.fill(grad_val * dLdp, size(y_pred_data)))
+            else
+                grad_tensor = TensorEngine.Tensor(fill(grad_val * dLdp, size(y_pred_data)))
+            end
+            
+            # Propagar gradiente
+            TensorEngine.backward(y_pred, grad_tensor)
         end
-        
-        # Propagar gradiente
-        TensorEngine.backward(y_pred, grad_tensor)
     end
     
     return result
@@ -75,6 +84,7 @@ end
     categorical_crossentropy(y_pred, y_true)
 
 Calcula la pérdida de entropía cruzada categórica para clasificación multiclase.
+Asume que y_pred ya contiene probabilidades (después de softmax).
 """
 function categorical_crossentropy(y_pred::TensorEngine.Tensor, y_true::TensorEngine.Tensor)::TensorEngine.Tensor
     # Detectar si estamos en GPU o CPU
@@ -117,79 +127,64 @@ function categorical_crossentropy(y_pred::TensorEngine.Tensor, y_true::TensorEng
     # Asegurar que estén en el mismo dispositivo
     if is_on_gpu && !(y_true_data isa CUDA.CuArray)
         y_true_data = CUDA.CuArray{Float32}(y_true_data)
-    elseif !is_on_gpu && (y_pred_data isa CUDA.CuArray)
-        y_pred_data = Array{Float32}(y_pred_data)
+    elseif !is_on_gpu && (y_true_data isa CUDA.CuArray)
         y_true_data = Array{Float32}(y_true_data)
-        is_on_gpu = false
     end
     
-    # Aplicar softmax manteniendo estabilidad numérica
+    # Estabilidad numérica
+    ε = 1.0f-7
+    
+    # Calcular pérdida
     if is_on_gpu
         # Versión GPU
-        max_vals = CUDA.maximum(y_pred_data, dims=1)
-        exp_vals = CUDA.exp.(y_pred_data .- max_vals)
-        probs = exp_vals ./ CUDA.sum(exp_vals, dims=1)
-        
-        # Estabilidad numérica
-        ε = 1.0f-7
-        ε_tensor = CUDA.fill(ε, size(probs))
-        
-        # Calcular pérdida y promediar
-        loss_per_sample = -CUDA.sum(y_true_data .* CUDA.log.(probs .+ ε_tensor), dims=1)
+        clipped_pred = CUDA.clamp.(y_pred_data, ε, 1.0f0 - ε)
+        loss_per_sample = -CUDA.sum(y_true_data .* CUDA.log.(clipped_pred), dims=1)
         loss_val = CUDA.sum(loss_per_sample) / Float32(size(loss_per_sample, 2))
-        
-        # Crear tensor de resultado
         result = TensorEngine.Tensor(CUDA.reshape([loss_val], (1, 1)))
     else
         # Versión CPU
-        max_vals = maximum(y_pred_data, dims=1)
-        exp_vals = exp.(y_pred_data .- max_vals)
-        probs = exp_vals ./ sum(exp_vals, dims=1)
-        
-        # Estabilidad numérica
-        ε = 1.0f-7
-        
-        # Calcular pérdida y promediar
-        loss_per_sample = -sum(y_true_data .* log.(probs .+ ε), dims=1)
+        clipped_pred = clamp.(y_pred_data, ε, 1.0f0 - ε)
+        loss_per_sample = -sum(y_true_data .* log.(clipped_pred), dims=1)
         loss_val = sum(loss_per_sample) / Float32(size(loss_per_sample, 2))
-        
-        # Crear tensor de resultado
         result = TensorEngine.Tensor(reshape([loss_val], (1, 1)))
     end
     
-    # Función backward con compatibilidad CPU/GPU y tipos consistentes
-    result.backward_fn = grad -> begin
-        # Asegurar que grad es Float32 y está en el dispositivo correcto
-        grad_data = grad
-        
-        # Convertir tipo de datos
-        if eltype(grad_data) != Float32
-            if is_on_gpu
-                grad_data = CUDA.convert.(Float32, grad_data)
-            else
-                grad_data = convert.(Float32, grad_data)
+    # Solo asignar backward_fn si y_pred requiere gradientes
+    if y_pred.requires_grad
+        result.backward_fn = grad -> begin
+            # Asegurar que grad es Float32 y está en el dispositivo correcto
+            grad_data = grad
+            
+            # Convertir tipo de datos
+            if eltype(grad_data) != Float32
+                if is_on_gpu
+                    grad_data = CUDA.convert.(Float32, grad_data)
+                else
+                    grad_data = convert.(Float32, grad_data)
+                end
             end
-        end
-        
-        # Asegurar mismo dispositivo
-        if (grad_data isa CUDA.CuArray) != is_on_gpu
-            if is_on_gpu
-                grad_data = CUDA.CuArray{Float32}(grad_data)
-            else
-                grad_data = Array{Float32}(grad_data)
+            
+            # Asegurar mismo dispositivo
+            if (grad_data isa CUDA.CuArray) != is_on_gpu
+                if is_on_gpu
+                    grad_data = CUDA.CuArray{Float32}(grad_data)
+                else
+                    grad_data = Array{Float32}(grad_data)
+                end
             end
+            
+            # Calcular gradiente: (probs - targets) / batch_size
+            batch_size = Float32(size(y_pred_data, 2))
+            
+            # Escalar gradiente
+            scaled_grad = (y_pred_data .- y_true_data) .* (grad_data ./ batch_size)
+            
+            # Propagar gradiente
+            TensorEngine.backward(y_pred, TensorEngine.Tensor(scaled_grad))
         end
-        
-        # Calcular gradiente: (probs - targets) / batch_size
-        batch_size = Float32(size(probs, 2))
-        
-        # Escalar gradiente
-        scaled_grad = (probs .- y_true_data) .* (grad_data ./ batch_size)
-        
-        # Propagar gradiente
-        TensorEngine.backward(y_pred, TensorEngine.Tensor(scaled_grad))
     end
     
     return result
 end
+
 end  # module Losses

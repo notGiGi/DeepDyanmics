@@ -224,18 +224,26 @@ end
 
 # ---------- Softmax ----------
 function softmax(t::TensorEngine.Tensor)::TensorEngine.Tensor
-    max_val      = maximum(t.data)
-    log_sum_exp  = log.(sum(exp.(t.data .- max_val))) + max_val
-    probs        = exp.(t.data .- log_sum_exp)
-
-    # ➊ conservar el flag
+    # Para formato (features, batch), softmax sobre dimensión 1
+    max_vals = maximum(t.data, dims=1)  # Máximo por columna
+    exp_vals = exp.(t.data .- max_vals)
+    sum_exp = sum(exp_vals, dims=1)
+    probs = exp_vals ./ sum_exp
+    
+    # Conservar requires_grad
     out = TensorEngine.Tensor(probs; requires_grad = t.requires_grad)
-
-    # ➋ mantener el backward
-    out.backward_fn = grad -> begin
-        grad_input = probs .* (grad .- sum(probs .* grad, dims=1))
-        TensorEngine.backward(t, TensorEngine.Tensor(grad_input))
+    
+    if t.requires_grad
+        out.backward_fn = grad -> begin
+            # Jacobiano de softmax: diag(p) - p*p'
+            # Para batch: grad * (probs .* (1 - probs)) para elementos diagonales
+            # menos suma de (grad .* probs) * probs para productos cruzados
+            grad_sum = sum(grad .* probs, dims=1)
+            grad_input = probs .* (grad .- grad_sum)
+            TensorEngine.backward(t, TensorEngine.Tensor(grad_input))
+        end
     end
+    
     return out
 end
 

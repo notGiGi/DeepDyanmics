@@ -28,7 +28,13 @@ let
         ("test/test_phase4.jl", "Test Fase 4 - BatchNorm"),
         ("test/diagnose_batchnorm.jl", "Diagnóstico BatchNorm FASE 4"),
         ("test/quick_verify_batchnorm.jl", "Verificación Rápida BatchNorm"),
-        ("test/test_phase4_full.jl", "Fase 4 Full")
+        ("test/test_phase4_full.jl", "Fase 4 Full"),
+
+        #FASE 5
+        ("test/test_phase5.jl", "Test Fase 5 - CNN"),
+
+        #FASE &
+        ("test/test_phase6.jl", "Test Fase 6 - GPU")
     ]
 
     for (file, name) in tests
