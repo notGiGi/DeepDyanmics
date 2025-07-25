@@ -6,6 +6,7 @@ using ..Optimizers
 using ..Visualizations
 using ..GPUMemoryManager  # Nuevo import para gestión de memoria
 using ..DataLoaders       # Nuevo import para DataLoaders optimizados
+using ..Utils: set_training_mode!
 using Random
 using LinearAlgebra
 using CUDA
@@ -14,9 +15,12 @@ export train!, train_batch!, compute_accuracy_general, train_improved!,
        EarlyStopping, Callback, PrintCallback, FinalReportCallback, add_callback!, 
        run_epoch_callbacks, run_final_callbacks, train_with_loaders, stack_batch, evaluate_model
 
+
+
 # -----------------------------------------------------------------------
 # Estructuras de EarlyStopping, Callbacks, etc.
 # -----------------------------------------------------------------------
+
 
 mutable struct EarlyStopping
     patience::Int
@@ -176,6 +180,19 @@ function stack_batch(batch::Vector{<:TensorEngine.Tensor})
         
     else
         error("Formato no soportado: ndims=$nd")
+    end
+end
+
+"""
+    safe_model_eval!(model)
+
+Pone el modelo en modo evaluación de forma segura.
+"""
+function safe_model_eval!(model)
+    try
+        set_training_mode!(model, false)
+    catch e
+        @warn "No se pudo cambiar a modo eval: $e"
     end
 end
 
@@ -400,7 +417,8 @@ function train_batch!(model::NeuralNetwork.Sequential, optimizer, loss_fn::Funct
                 val_out = NeuralNetwork.forward(model, val_input_batch)
                 val_batch_loss = loss_fn(val_out, val_label_batch)
                 
-                val_loss_sum += val_batch_loss.data[1]
+                val_loss_sum += Array(val_batch_loss.data)[1]
+
                 val_batches += 1
             end
             
@@ -498,7 +516,7 @@ function train_with_loaders(model, optimizer, loss_fn, train_loader, val_loader,
             step!(optimizer, params)
             
             # Acumular pérdida
-            epoch_loss += loss.data[1]
+            epoch_loss += Array(loss.data)[1]
             num_batches += 1
             
             # Liberar memoria GPU después de cada batch
@@ -652,7 +670,8 @@ function train_improved!(
     
     # Parámetros del modelo
     params = NeuralNetwork.collect_parameters(model)
-    
+    # Establecer modo training
+    set_training_mode!(model, true)
     for epoch in 1:epochs
         epoch_start = time()
         
@@ -723,7 +742,7 @@ function train_improved!(
                 # Calcular loss
                 loss = loss_fn(output, batch_y)
                 
-                if isnan(loss.data[1])
+                if isnan(Array(loss.data)[1])
                     verbose && println("  ⚠️ Pérdida NaN detectada, saltando lote")
                     continue
                 end
@@ -741,16 +760,24 @@ function train_improved!(
                 step!(optimizer, params)
                 
                 # Acumular pérdida
-                epoch_loss += loss.data[1]
+                epoch_loss += Array(loss.data)[1]
                 num_batches += 1
                 
                 # Liberar memoria GPU
                 if use_gpu
-                    CUDA.unsafe_free!(batch_x.data)
-                    CUDA.unsafe_free!(batch_y.data)
-                    CUDA.unsafe_free!(output.data)
-                    GC.gc()
-                    CUDA.reclaim()
+                    # Liberar buffers específicos del batch
+                    try
+                        # Intentar liberar con GPUMemoryManager
+                        GPUMemoryManager.release_tensor_buffer(batch_x.data)
+                        GPUMemoryManager.release_tensor_buffer(output.data)
+                    catch
+                        # Fallback a liberación directa si falla
+                        CUDA.unsafe_free!(batch_x.data)
+                        CUDA.unsafe_free!(output.data)
+                    end
+                    
+                    # Auto-limpieza si es necesario
+                    GPUMemoryManager.check_and_clear_gpu_memory(verbose=false)
                 end
             catch e
                 verbose && println("  ⚠️ Error en lote: $e")
@@ -814,10 +841,12 @@ function train_improved!(
                     # Calcular loss
                     val_batch_loss = loss_fn(val_output, val_y)
                     
-                    if !isnan(val_batch_loss.data[1])
-                        val_loss_sum += val_batch_loss.data[1]
+                    val_loss_val = Array(val_batch_loss.data)[1]
+                    if !isnan(val_loss_val)
+                        val_loss_sum += val_loss_val
                         val_batches += 1
                     end
+
                     
                     # Liberar memoria GPU
                     if use_gpu
@@ -879,7 +908,13 @@ function train_improved!(
             CUDA.reclaim()
         end
     end
+        set_training_mode!(model, false)
     
+    # Limpieza final de GPU
+    if use_gpu
+        GPUMemoryManager.clear_cache()
+    end
+
     return train_losses, val_losses, train_accs, val_accs
 end
 
@@ -1052,7 +1087,7 @@ function train_improved_gpu!(
             step!(optimizer, params)
             
             # Acumular pérdida
-            epoch_loss += loss.data[1]
+            epoch_loss += Array(loss.data)[1]
             num_batches += 1
             
             # Liberar tensores temporales

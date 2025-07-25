@@ -16,7 +16,8 @@ export Sequential, Dense, Activation, collect_parameters,
        model_to_gpu, model_to_cpu, model_device, model_to_device,
        layer_to_device, forward
 
-
+import ..Layers: BatchNorm
+import ..Layers: forward as batchnorm_forward
 # ==================================================================
 # Capa Dense Optimizada (Sin activación integrada)
 # ==================================================================
@@ -101,6 +102,7 @@ end
 
 
 (model::Sequential)(input) = forward(model, input)
+
 
 
 
@@ -422,12 +424,82 @@ end
 
 
 
-
 function layer_to_device(layer, device::Symbol)
     # Capas sin parámetros (Flatten, Activation, Dropout, etc.)
     return layer
 end
 
+"""
+    forward(layer::DropoutLayer, input::TensorEngine.Tensor)
 
+Aplica dropout durante entrenamiento, pasa sin cambios durante evaluación.
+"""
+function NeuralNetwork.forward(layer::DropoutLayer, input::TensorEngine.Tensor)
+    # Sin dropout en modo evaluación o si rate es 0
+    if !layer.training || layer.rate == 0
+        return input
+    end
+    
+    # Validar tasa de dropout
+    if !(0 <= layer.rate < 1)
+        throw(ArgumentError("Dropout rate debe estar en [0, 1), recibido: $(layer.rate)"))
+    end
+    
+    # Detectar dispositivo
+    is_on_gpu = input.data isa CUDA.CuArray
+    
+    # Escala para inverted dropout
+    scale = 1.0f0 / (1.0f0 - layer.rate)
+    
+    # Generar máscara binaria
+    if is_on_gpu
+        # Para GPU
+        rand_vals = CUDA.rand(Float32, size(input.data))
+        mask = rand_vals .> layer.rate
+        output_data = input.data .* mask .* scale
+    else
+        # Para CPU
+        rand_vals = rand(Float32, size(input.data))
+        mask = rand_vals .> layer.rate
+        output_data = input.data .* mask .* scale
+    end
+    
+    # Crear tensor de salida con requires_grad correcto
+    out = TensorEngine.Tensor(output_data; requires_grad=input.requires_grad)
+    
+    # Definir función backward solo si necesario
+    if input.requires_grad
+        # Capturar variables para el closure
+        saved_mask = mask
+        saved_scale = scale
+        saved_is_gpu = is_on_gpu
+        
+        out.backward_fn = function(grad)
+            # Convertir grad si es necesario
+            grad_data = grad isa TensorEngine.Tensor ? grad.data : grad
+            
+            # Asegurar dispositivo correcto
+            if (grad_data isa CUDA.CuArray) != saved_is_gpu
+                if saved_is_gpu
+                    grad_data = CUDA.CuArray(grad_data)
+                else
+                    grad_data = Array(grad_data)
+                end
+            end
+            
+            # Propagar gradiente con la misma máscara
+            grad_input = grad_data .* saved_mask .* saved_scale
+            
+            # Llamar backward del input
+            TensorEngine.backward(input, TensorEngine.Tensor(grad_input; requires_grad=false))
+        end
+    end
+    
+    return out
+end
+
+function forward(layer::BatchNorm, input::Tensor)
+    return batchnorm_forward(layer, input)
+end
 
 end # module NeuralNetwork

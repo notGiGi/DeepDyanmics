@@ -2,7 +2,7 @@ module Layers
 
 using NNlib, CUDA, ..TensorEngine, ..AbstractLayer, ..ConvKernelLayers, Statistics, ..ConvolutionalLayers
 export BatchNorm, Flatten, LayerActivation, set_training!, reset_running_stats!, GlobalAvgPool, ResidualBlock, create_residual_block, CustomFlatten, DropoutLayer
-# Añadir en Layers.jl justo antes del end del módulo
+
 
 # ==================================================================
 # BatchNorm Optimizado (Fusión GPU)
@@ -466,58 +466,103 @@ function get_stats(layer::BatchNorm)
     )
 end
 
+
+
+
 # ==================================================================
 # Dropout Optimizado (Bitmask en GPU)
 # ==================================================================
 """
 Versión mejorada de Dropout que es callable directamente
 """
-struct DropoutLayer <: AbstractLayer.Layer
-    rate::Float32    # Tasa de dropout
-    training::Bool   # Modo entrenamiento/inferencia
+# Definición de DropoutLayer
+mutable struct DropoutLayer <: AbstractLayer.Layer
+    rate::Float32
+    training::Bool
 end
 
-# Constructor con tipos Float32 explícitos
+# Constructor
 function DropoutLayer(rate::Real; training=true)
     return DropoutLayer(Float32(rate), training)
 end
 
+# IMPLEMENTACIÓN COMPLETA DE FORWARD
+"""
+    forward(layer::DropoutLayer, input::TensorEngine.Tensor)
+
+Aplica dropout durante entrenamiento, pasa sin cambios durante evaluación.
+Mantiene la media esperada usando inverted dropout.
+"""
 function forward(layer::DropoutLayer, input::TensorEngine.Tensor)
+    # Sin dropout en modo evaluación o si rate es 0
     if !layer.training || layer.rate == 0
         return input
     end
     
-    # Crear máscara de dropout - Corregido para CUDA
-    is_on_gpu = (input.data isa CUDA.CuArray)
-    input_shape = size(input.data)
-    
-    if is_on_gpu
-        # En GPU, necesitamos generar la máscara de manera segura
-        # Crear un array de números aleatorios en GPU
-        rand_vals = CUDA.rand(Float32, input_shape)
-        # Crear máscara como array de Float32 (no BitArray)
-        mask = CUDA.float(rand_vals .> layer.rate)  # Convertir a Float32 directamente
-        # Aplicar máscara y escalar
-        scale = 1.0f0 / (1.0f0 - layer.rate)  # Escalar como Float32
-        output = input.data .* mask .* scale  # Multiplicación escalar en vez de división
-    else
-        # En CPU 
-        rand_vals = rand(Float32, input_shape)
-        mask = float(rand_vals .> layer.rate)
-        scale = 1.0f0 / (1.0f0 - layer.rate)
-        output = input.data .* mask .* scale
+    # Validar tasa de dropout
+    if !(0 <= layer.rate < 1)
+        throw(ArgumentError("Dropout rate debe estar en [0, 1), recibido: $(layer.rate)"))
     end
     
-    # Crear tensor de salida
-    result = TensorEngine.Tensor(output)
+    # Detectar dispositivo
+    is_on_gpu = input.data isa CUDA.CuArray
     
-    return result
+    # Escala para inverted dropout
+    scale = 1.0f0 / (1.0f0 - layer.rate)
+    
+    # Generar máscara binaria
+    if is_on_gpu
+        # Para GPU
+        rand_vals = CUDA.rand(Float32, size(input.data))
+        mask = rand_vals .> layer.rate
+        output_data = input.data .* mask .* scale
+    else
+        # Para CPU
+        rand_vals = rand(Float32, size(input.data))
+        mask = rand_vals .> layer.rate
+        output_data = input.data .* mask .* scale
+    end
+    
+    # Crear tensor de salida con requires_grad correcto
+    out = TensorEngine.Tensor(output_data; requires_grad=input.requires_grad)
+    
+    # Definir función backward solo si necesario
+    if input.requires_grad
+        # Capturar variables para el closure
+        saved_mask = mask
+        saved_scale = scale
+        saved_is_gpu = is_on_gpu
+        
+        out.backward_fn = function(grad)
+            # Convertir grad si es necesario
+            grad_data = grad isa TensorEngine.Tensor ? grad.data : grad
+            
+            # Asegurar dispositivo correcto
+            if (grad_data isa CUDA.CuArray) != saved_is_gpu
+                if saved_is_gpu
+                    grad_data = CUDA.CuArray(grad_data)
+                else
+                    grad_data = Array(grad_data)
+                end
+            end
+            
+            # Propagar gradiente con la misma máscara
+            grad_input = grad_data .* saved_mask .* saved_scale
+            
+            # Llamar backward del input
+            TensorEngine.backward(input, TensorEngine.Tensor(grad_input; requires_grad=false))
+        end
+    end
+    
+    return out
 end
 
-# Hacer la capa callable directamente
+# Hacer DropoutLayer callable (azúcar sintáctico)
 function (layer::DropoutLayer)(input::TensorEngine.Tensor)
     return forward(layer, input)
 end
+
+
 
 # ==================================================================
 # Flatten Optimizado (Soporte batches en formato WHCN)

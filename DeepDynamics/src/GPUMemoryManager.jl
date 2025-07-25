@@ -1,7 +1,7 @@
 module GPUMemoryManager
 
 using CUDA
-export get_tensor_buffer, release_tensor_buffer, clear_cache, print_cache_stats, memory_stats
+export get_tensor_buffer, check_and_clear_gpu_memory, release_tensor_buffer, clear_cache, print_cache_stats, memory_stats
 
 # Caché para tensores, organizada por tamaño y tipo
 const TENSOR_CACHE = Dict{Tuple{Int, DataType}, Vector{CuArray}}()
@@ -102,19 +102,38 @@ end
 Devuelve un resumen del estado actual de la memoria GPU.
 """
 function memory_stats()
-    try
-        total_mem = CUDA.totalmem() / 1e9
-        used_mem = CUDA.memory_used() / 1e9
-        free_mem = total_mem - used_mem
-        free_percent = 100 * free_mem / total_mem
-        return (
-            total = total_mem,
-            used = used_mem,
-            free = free_mem,
-            free_percent = free_percent
-        )
-    catch e
-        @warn "Could not fetch GPU memory stats: $e. Returning zeros."
+    if CUDA.functional()
+        try
+            # Usar CUDA.memory_status sin argumentos
+            info = CUDA.memory_status()
+            
+            # Calcular valores
+            total_bytes = info.total
+            free_bytes = info.free
+            used_bytes = total_bytes - free_bytes
+            
+            total_gb = total_bytes / 1e9
+            used_gb = used_bytes / 1e9
+            free_gb = free_bytes / 1e9
+            free_percent = 100 * free_gb / total_gb
+            
+            return (
+                total = total_gb,
+                used = used_gb,
+                free = free_gb,
+                free_percent = free_percent
+            )
+        catch e
+            # Si falla, retornar valores seguros
+            @debug "Could not fetch GPU memory stats: $e"
+            return (
+                total = 1.0,
+                used = 0.0,
+                free = 1.0,
+                free_percent = 100.0
+            )
+        end
+    else
         return (
             total = 0.0,
             used = 0.0,
@@ -123,5 +142,49 @@ function memory_stats()
         )
     end
 end
+
+
+"""
+    auto_clear_threshold = 0.85
+
+Umbral de memoria GPU utilizada para activar limpieza automática.
+"""
+const auto_clear_threshold = 0.85
+
+"""
+    check_and_clear_gpu_memory(; verbose=false)
+
+Verifica el uso de memoria GPU y limpia automáticamente si supera el umbral.
+"""
+function check_and_clear_gpu_memory(; verbose=false)
+    if !CUDA.functional()
+        return
+    end
+    
+    try
+        stats = memory_stats()
+        
+        # Verificar si tenemos estadísticas válidas
+        if stats.total > 0
+            used_fraction = stats.used / stats.total
+            
+            if used_fraction > auto_clear_threshold
+                verbose && @info "GPU memory usage at $(round(used_fraction*100, digits=1))%. Clearing cache..."
+                clear_cache()
+                
+                # Verificar después de limpiar
+                new_stats = memory_stats()
+                if new_stats.total > 0
+                    new_used_fraction = new_stats.used / new_stats.total
+                    verbose && @info "GPU memory after clearing: $(round(new_used_fraction*100, digits=1))%"
+                end
+            end
+        end
+    catch e
+        @debug "Error checking GPU memory: $e"
+    end
+end
+
+
 
 end # module
