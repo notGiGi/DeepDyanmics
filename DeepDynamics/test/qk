@@ -1,0 +1,28 @@
+using DeepDynamics
+using CUDA
+using DeepDynamics.TensorEngine
+using DeepDynamics.Layers
+using DeepDynamics.NeuralNetwork
+# Mini‑CNN como en los tests
+model_cpu = Sequential([
+    Conv2D(3, 16, (3,3); padding=(1,1)),
+    Layers.BatchNorm(16),
+    Layers.Flatten(),
+    Dense(16*32*32, 10)
+])
+
+# Clonar a GPU
+NeuralNetwork.model_gpu = model_to_gpu(model_cpu)
+
+# Datos dummy
+x = TensorEngine.Tensor(CUDA.rand(Float32, 4, 3, 32, 32); requires_grad=true)
+y = TensorEngine.Tensor(CUDA.rand(Float32, 10, 4); requires_grad=false)
+
+# === Forward + Loss + Backward ===
+ŷ    = model_gpu(x)              # forward
+loss = TensorEngine.mse_loss(ŷ, y)
+TensorEngine.backward(loss)      # backward
+
+# ¿Quién quedó sin grad?
+missing = filter(p -> p.grad === nothing, collect_parameters(model_gpu))
+@show length(missing), typeof.(missing)

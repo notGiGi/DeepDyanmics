@@ -4,7 +4,7 @@ using ..GPUMemoryManager
 
 export Tensor, add, matmul, backward, mse_loss, initialize_grad!,
        initialize_weights, l2_regularization, compute_loss_with_regularization,
-       clip_gradients!, to_gpu, to_cpu, softmax, zero_grad!
+       clip_gradients!, to_gpu, to_cpu, gpu_memory_info,softmax, zero_grad!, device_of,same_device, ensure_gpu_memory!
 
 using Random, Statistics, LinearAlgebra
 try
@@ -35,10 +35,6 @@ function Tensor(data::AbstractArray{Float32, N}; requires_grad=true) where {N}
     return Tensor{N}(data, nothing, nothing, requires_grad)
 end
 
-# Constructor para arrays de otro tipo (se convierten a Float32).
-function Tensor(data::AbstractArray{T, N}; requires_grad=true) where {T<:Real, N}
-    return Tensor{N}(Float32.(data), nothing, nothing, requires_grad)
-end
 
 # ---------------------------------------------------------------------------
 # Compatibilidad con Base
@@ -99,43 +95,112 @@ function ensure_compatible(data, reference_data)
 end
 
 
-# Añade estas funciones a TensorEngine.jl
+
+
+"""
+    device_of(x::AbstractArray) -> Symbol
+Detecta si el array está en :gpu o :cpu
+"""
 function device_of(x::AbstractArray)
     return x isa CUDA.CuArray ? :gpu : :cpu
 end
 
-function device_of(t::Tensor)
+"""
+    device_of(t::Tensor) -> Symbol
+Detecta si el tensor está en :gpu o :cpu
+"""
+function device_of(t::TensorEngine.Tensor)
     return device_of(t.data)
 end
 
-function ensure_on_device(data, device::Symbol)
+
+"""
+    device_of(::Nothing) -> Symbol
+Devuelve :cpu por defecto
+"""
+function device_of(::Nothing)
+    return :cpu
+end
+
+
+"""
+    ensure_on_device(data, device::Symbol)
+Mueve datos al dispositivo especificado si es necesario
+"""
+function ensure_on_device(data::AbstractArray, device::Symbol)
     current_device = device_of(data)
     if current_device == device
         return data
     end
-    
+
     if device == :gpu
-        return CUDA.CuArray(data)
+        if CUDA.functional()
+            return CUDA.CuArray(data)
+        else
+            @warn "GPU requested but CUDA not available. Keeping data on CPU."
+            return data
+        end
     else
-        return Array(data)
+        return current_device == :gpu ? Array(data) : data
     end
 end
 
+"""
+    ensure_on_device(t::Tensor, device::Symbol)
+Mueve un tensor completo al dispositivo especificado
+"""
 function ensure_on_device(t::Tensor, device::Symbol)
-    if device_of(t) == device
+    current_device = device_of(t)
+    if current_device == device
         return t
     end
-    
+
     new_data = ensure_on_device(t.data, device)
-    result = Tensor(new_data; requires_grad=t.requires_grad)
-    
-    if t.grad !== nothing
-        result.grad = ensure_on_device(t.grad, device)
-    end
-    
+    new_grad = t.grad !== nothing ? ensure_on_device(t.grad, device) : nothing
+
+    result = Tensor(new_data; requires_grad = t.requires_grad)
+    result.grad = new_grad
     result.backward_fn = t.backward_fn
     return result
 end
+
+function ensure_on_device(::Nothing, ::Symbol)
+    return nothing
+end
+
+
+"""
+    same_device(a, b) -> Bool
+Verifica si dos objetos están en el mismo dispositivo
+"""
+function same_device(a, b)
+    return device_of(a) == device_of(b)
+end
+
+"""
+    match_device(target, reference)
+Mueve target al mismo dispositivo que reference
+"""
+function match_device(reference, target)
+    ref_device = device_of(reference)
+    tgt_device = device_of(target)
+
+    if ref_device != tgt_device
+        # Mover datos y gradiente
+        new_data = TensorEngine.ensure_on_device(target.data, ref_device)
+        new_grad = isnothing(target.grad) ? nothing :
+                   TensorEngine.ensure_on_device(target.grad, ref_device)
+
+        # Crear nuevo tensor sin usar keyword grad=
+        result = TensorEngine.Tensor(new_data; requires_grad=target.requires_grad)
+        result.grad = new_grad
+        result.backward_fn = target.backward_fn
+        return result
+    else
+        return target  # Ya en el dispositivo correcto
+    end
+end
+
 
 
 
@@ -216,6 +281,110 @@ function matmul(t1::Tensor{2}, t2::Tensor{2})::Tensor{2}
     return result
 end
 
+# Agregar estas funciones a TensorEngine.jl después de la función add
+
+# Multiplicación escalar
+function Base.:*(scalar::Number, t::Tensor)
+    result_data = scalar .* t.data
+    result = Tensor(result_data; requires_grad=t.requires_grad)
+    
+    if t.requires_grad
+        result.backward_fn = grad -> begin
+            grad_data = grad isa Tensor ? grad.data : grad
+            backward(t, Tensor(scalar .* grad_data; requires_grad=false))
+        end
+    end
+    
+    return result
+end
+
+function Base.:*(t::Tensor, scalar::Number)
+    return scalar * t
+end
+
+# Suma escalar
+function Base.:+(t::Tensor, scalar::Number)
+    result_data = t.data .+ scalar
+    result = Tensor(result_data; requires_grad=t.requires_grad)
+    
+    if t.requires_grad
+        result.backward_fn = grad -> begin
+            grad_data = grad isa Tensor ? grad.data : grad
+            backward(t, Tensor(grad_data; requires_grad=false))
+        end
+    end
+    
+    return result
+end
+
+function Base.:+(scalar::Number, t::Tensor)
+    return t + scalar
+end
+
+# Resta
+function Base.:-(t1::Tensor{N}, t2::Tensor{N}) where {N}
+    result_data = t1.data .- t2.data
+    result = Tensor(result_data; requires_grad=(t1.requires_grad || t2.requires_grad))
+    
+    result.backward_fn = grad -> begin
+        grad_data = grad isa Tensor ? grad.data : grad
+        if t1.requires_grad
+            backward(t1, Tensor(grad_data; requires_grad=false))
+        end
+        if t2.requires_grad
+            backward(t2, Tensor(-grad_data; requires_grad=false))
+        end
+    end
+    
+    return result
+end
+
+# División
+function Base.:/(t::Tensor, scalar::Number)
+    return (1.0f0 / scalar) * t
+end
+
+# Para soportar broadcasting con .* .+ etc
+Base.broadcastable(t::Tensor) = t
+Base.axes(t::Tensor) = axes(t.data)
+Base.ndims(::Type{<:Tensor{N}}) where {N} = N
+Base.eltype(t::Tensor) = eltype(t.data)
+Base.similar(t::Tensor, ::Type{T}, dims::Dims) where {T} = Tensor(similar(t.data, T, dims))
+
+# Implementar interfaz de broadcasting
+struct TensorStyle <: Base.Broadcast.BroadcastStyle end
+Base.BroadcastStyle(::Type{<:Tensor}) = TensorStyle()
+
+# Cuando se mezclan Tensor y Array/Number
+Base.BroadcastStyle(::TensorStyle, ::Base.Broadcast.DefaultArrayStyle) = TensorStyle()
+Base.BroadcastStyle(::TensorStyle, ::Base.Broadcast.Style{Tuple}) = TensorStyle()
+
+# Materializar el broadcast
+function Base.Broadcast.broadcasted(::TensorStyle, op, args...)
+    # Extraer datos de los Tensores
+    data_args = map(args) do arg
+        arg isa Tensor ? arg.data : arg
+    end
+    
+    # Aplicar la operación
+    result_data = Base.Broadcast.broadcasted(op, data_args...)
+    
+    # Si es una operación simple, materializarla
+    if op in (+, -, *, /)
+        result_data = Base.Broadcast.materialize(result_data)
+        # Determinar si requiere gradientes
+        requires_grad = any(arg isa Tensor && arg.requires_grad for arg in args)
+        return Tensor(result_data; requires_grad=requires_grad)
+    else
+        # Para operaciones más complejas, devolver el objeto broadcasted
+        return result_data
+    end
+end
+
+# Para que funcione el broadcast assignment
+Base.copyto!(dest::Tensor, src::Tensor) = (copyto!(dest.data, src.data); dest)
+Base.copyto!(dest::Tensor, src) = (copyto!(dest.data, src); dest)
+
 # Reemplaza la función backward en TensorEngine.jl con esta versión
 function backward(t::Tensor, grad::Union{Tensor, AbstractArray})
     # Verificar si requiere gradientes
@@ -272,20 +441,24 @@ end
 
 function mse_loss(y_pred::Tensor, y_true::Tensor)::Tensor
     error = y_pred.data .- y_true.data
-    loss_val = sum(error .^ 2) / max(length(y_pred.data), 1)
-    
-    # Crear tensor escalar (1D con 1 elemento)
-    result = Tensor([loss_val]; requires_grad=true)
-    
+    n = max(length(y_pred.data), 1)
+
+    loss_val = error isa CUDA.CuArray ? CUDA.sum(error .^ 2) / n : sum(error .^ 2) / n
+
+    result = Tensor(Float32[loss_val]; requires_grad=true)
+
     result.backward_fn = grad_scalar -> begin
-        # grad_scalar es el gradiente que viene de arriba (escalar)
-        grad_val = grad_scalar isa AbstractArray ? grad_scalar[1] : grad_scalar
-        grad_input = (2.0f0 .* error ./ max(length(y_pred.data), 1)) .* grad_val
+        grad_val = grad_scalar isa AbstractArray ? only(Array(grad_scalar)) : grad_scalar
+        grad_input = (2.0f0 .* error ./ n) .* grad_val
         backward(y_pred, Tensor(grad_input))
     end
-    
+
     return result
 end
+
+
+
+
 
 function initialize_grad!(t::Tensor)
     if t.requires_grad && t.grad === nothing
@@ -333,48 +506,142 @@ function clip_gradients!(t::Tensor, threshold::Float64)
 end
 
 
-
-# ---------------------------------------------------------------------------
-# Función Softmax
-# ---------------------------------------------------------------------------
-function softmax(x::Tensor)::Tensor
-    exps = exp.(x.data .- maximum(x.data))
-    sum_exps = sum(exps)
-    probs = exps ./ sum_exps
-    return Tensor(probs; requires_grad=x.requires_grad)
+struct GPUMemoryInfo
+    total::Float64
+    used::Float64
+    available::Float64
+    free_percent::Float64
 end
+
+
+
+"""
+    gpu_memory_info() -> NamedTuple
+
+Returns the current GPU memory usage statistics.
+"""
+function gpu_memory_info()
+    if !CUDA.functional()
+        return (
+            total = 0.0,
+            used = 0.0,
+            free = 0.0,
+            free_percent = 0.0
+        )
+    end
+    
+    try
+        # Llamar sin argumentos - no usar fallback
+        mem_status = CUDA.memory_status()
+        
+        # Extraer valores
+        total_mem = mem_status.total / 1e9      # Total en GB
+        free_mem = mem_status.free / 1e9        # Libre en GB
+        used_mem = total_mem - free_mem         # Usada en GB
+        free_percent = 100.0 * free_mem / total_mem
+
+        return (
+            total = total_mem,
+            used = used_mem,
+            free = free_mem,
+            free_percent = free_percent
+        )
+    catch e
+        @debug "Could not fetch GPU memory info: $e"
+        # Retornar valores seguros sin warning para no ensuciar los tests
+        return (
+            total = 1.0,      # Evitar división por cero
+            used = 0.0,
+            free = 1.0,
+            free_percent = 100.0
+        )
+    end
+end
+
+
+
+
+
+
+
+
+
+
+"""
+    ensure_gpu_memory!(target_free_percent::Float64)
+
+Forces a memory cleanup if GPU free memory falls below `target_free_percent`.
+"""
+function ensure_gpu_memory!(target_free_percent::Float64)
+    info = gpu_memory_info()
+    if info.free_percent < target_free_percent
+        @info "Free GPU memory below $(target_free_percent)% - triggering cleanup."
+        GC.gc()
+        CUDA.reclaim()
+        CUDA.synchronize()
+    else
+        @info "GPU memory usage is within safe limits ($(round(info.free_percent, digits=2))% free)."
+    end
+end
+
+
+
+
+
+
+
+# ------------- antiguo -------------
+# function softmax(x::Tensor)::Tensor
+#     exps      = exp.(x.data .- maximum(x.data))
+#     sum_exps  = sum(exps)
+#     probs     = exps ./ sum_exps
+#     return Tensor(probs; requires_grad = x.requires_grad)
+# end
+# -----------------------------------
+
 
 # ---------------------------------------------------------------------------
 # Funciones para mover tensores a GPU/CPU
 # ---------------------------------------------------------------------------
 
 function to_gpu(t::TensorEngine.Tensor)
+    if device_of(t) == :gpu
+        return t  # Ya está en GPU
+    end
+
     if CUDA.functional()
-        if !(t.data isa CuArray)
-            # Asegurarnos de que los datos están en GPU
-            t.data = CuArray(t.data)
+        new_data = CuArray(t.data)
+        new_grad = t.grad !== nothing ? CuArray(t.grad.data) : nothing
+        new_tensor = TensorEngine.Tensor(new_data; requires_grad=t.requires_grad)
+        if new_grad !== nothing
+            new_tensor.grad = TensorEngine.Tensor(new_grad; requires_grad=false)
         end
-        if t.grad !== nothing && !(t.grad.data isa CuArray)
-            # También convertir el gradiente a GPU
-            t.grad.data = CuArray(t.grad.data)
-        end
+        new_tensor.backward_fn = t.backward_fn
+        return new_tensor
     else
         @warn "CUDA not functional, tensor remains on CPU."
+        return t
     end
-    return t
 end
+
 
 function to_gpu(x::CUDA.CuArray)
     # Si el objeto ya es un CuArray, simplemente lo retorna.
     return x
 end
 
+"""
+    to_cpu(t::Tensor) -> Tensor
+Crea una copia del tensor en CPU sin modificar el original.
+"""
 function to_cpu(t::Tensor)
-    t.data = Array(t.data)
-    if t.grad !== nothing
-        t.grad.data = Array(t.grad.data)
-    end
-    return t
+    new_data = t.data isa CUDA.CuArray ? Array(t.data) : t.data
+    new_grad = t.grad !== nothing && t.grad.data isa CUDA.CuArray ?
+               Tensor(Array(t.grad.data); requires_grad=false) : t.grad
+    return Tensor(new_data;
+                  requires_grad = t.requires_grad,
+                  grad = new_grad,
+                  backward_fn = t.backward_fn)
 end
 
 # ---------------------------------------------------------------------------
@@ -393,6 +660,18 @@ end
 function release_buffers!()
     empty!(MEMORY_POOL)
     CUDA.reclaim()
+end
+
+"""
+    Tensor(data; requires_grad=true, grad=nothing, backward_fn=nothing)
+
+Crea un tensor completo con todos los campos opcionales.
+"""
+function Tensor(data::AbstractArray{T, N};
+                requires_grad::Bool = true,
+                grad::Union{Nothing, Tensor} = nothing,
+                backward_fn::Union{Function, Nothing} = nothing) where {T<:Real, N}
+    return Tensor{N}(data, grad, backward_fn, requires_grad)
 end
 
 
