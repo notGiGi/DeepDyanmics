@@ -722,23 +722,31 @@ end
 struct GlobalAvgPool <: AbstractLayer.Layer end
 
 function forward(layer::GlobalAvgPool, input::TensorEngine.Tensor)
-    # Añadir depuración
-    #println("GlobalAvgPool - Input shape: ", size(input.data))
+    # Input shape: (N, C, H, W)
+    N, C, H, W = size(input.data)
     
-    dims = size(input.data)
-    if length(dims) == 4  # Tensor 4D (NCHW)
-        # Promedio en dimensiones espaciales (alto y ancho)
-        output = mean(input.data, dims=(3, 4))
-    else
-        # Manejo de caso general
-        output = input.data
+    # Average over spatial dimensions
+    output_data = mean(input.data, dims=(3,4))  # Result: (N, C, 1, 1)
+    output = TensorEngine.Tensor(output_data)
+    
+    # CRÍTICO: Agregar backward_fn
+    output.backward_fn = grad -> begin
+        # El gradiente se distribuye uniformemente sobre H*W elementos
+        grad_data = grad isa TensorEngine.Tensor ? grad.data : grad
+        
+        # Expandir el gradiente a las dimensiones originales
+        # grad viene como (N, C, 1, 1), necesitamos (N, C, H, W)
+        grad_expanded = grad_data ./ (H * W)  # Dividir por número de elementos promediados
+        
+        # Broadcast a las dimensiones originales
+        grad_input = repeat(grad_expanded, 1, 1, H, W)
+        
+        TensorEngine.backward(input, TensorEngine.Tensor(grad_input))
     end
     
-    #println("GlobalAvgPool - Output shape: ", size(output))
-    return TensorEngine.Tensor(output)
+    return output
 end
 
-# Método para hacer GlobalAvgPool callable
 function (layer::GlobalAvgPool)(input::TensorEngine.Tensor)
     return forward(layer, input)
 end
@@ -819,44 +827,45 @@ end
 
 
 
-# En Layers.jl - Mejorar el debug en ResidualBlock
 function forward(block::ResidualBlock, input::TensorEngine.Tensor)
-    # Debug para verificar dimensiones
-    input_shape = size(input.data)
-    println("ResidualBlock input shape: $input_shape")
-    
     # Camino convolucional
     conv_out = input
-    for (i, layer) in enumerate(block.conv_path)
+    for layer in block.conv_path
         conv_out = layer(conv_out)
-        println("  Conv path layer $i output shape: $(size(conv_out.data))")
     end
     
     # Camino shortcut
     shortcut_out = input
     if !isempty(block.shortcut)
-        for (i, layer) in enumerate(block.shortcut)
+        for layer in block.shortcut
             shortcut_out = layer(shortcut_out)
-            println("  Shortcut layer $i output shape: $(size(shortcut_out.data))")
         end
     end
     
-    # Verificar que las dimensiones coincidan antes de sumar
+    # Verificar que las dimensiones coincidan
     conv_shape = size(conv_out.data)
     shortcut_shape = size(shortcut_out.data)
+
     
     if conv_shape != shortcut_shape
-        error("Shape mismatch in ResidualBlock: conv_path=$conv_shape, shortcut=$shortcut_shape")
+        error("""
+        Shape mismatch in ResidualBlock:
+        - Conv path output: $conv_shape
+        - Shortcut output: $shortcut_shape
+        
+        This typically happens when:
+        1. Stride is not properly handled in shortcut
+        2. Channel dimensions don't match
+        3. Spatial dimensions are incompatible
+        """)
     end
     
     # Sumar ambos caminos
     output = TensorEngine.add(conv_out, shortcut_out)
-    println("  ResidualBlock output shape: $(size(output.data))")
     
     # Aplicar activación final
     return LayerActivation(relu)(output)
 end
-
 function (block::ResidualBlock)(input::TensorEngine.Tensor)
     return forward(block, input)
 end

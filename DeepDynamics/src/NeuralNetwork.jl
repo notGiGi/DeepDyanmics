@@ -498,6 +498,21 @@ function NeuralNetwork.forward(layer::DropoutLayer, input::TensorEngine.Tensor)
     return out
 end
 
+"""
+    zero_grad!(model::Sequential)
+
+Reinicia los gradientes de todos los parámetros del modelo a cero.
+"""
+function zero_grad!(model::Sequential)
+    params = collect_parameters(model)
+    for p in params
+        if p.requires_grad
+            TensorEngine.zero_grad!(p)
+        end
+    end
+end
+
+
 function forward(layer::BatchNorm, input::Tensor)
     return batchnorm_forward(layer, input)
 end

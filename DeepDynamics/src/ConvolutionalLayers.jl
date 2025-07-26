@@ -90,27 +90,27 @@ function (layer::Conv2D)(input::TensorEngine.Tensor)
     out = TensorEngine.Tensor(y; requires_grad=needs_grad)
 
     if needs_grad
-    # capturamos variables para backward
-    stride = layer.stride; pad = layer.padding
-    kH, kW = size(layer.weights.data, 3), size(layer.weights.data, 4)
-    
-    # AGREGAR: Crear ConvDims para los gradientes
-    # Necesitamos las dimensiones de entrada
-    H_in = size(x_hwcn, 1)
-    W_in = size(x_hwcn, 2)
-    cdims = NNlib.DenseConvDims(x_hwcn, w_hwio;
-                            stride=stride, padding=pad, dilation=(1,1))
-    
-    out.backward_fn = grad -> begin
-        dy = grad isa TensorEngine.Tensor ? grad.data : grad
-        dy_hwcn = permutedims(on_gpu ? dy : Array(dy), (3,4,2,1))
+        # capturamos variables para backward
+        stride = layer.stride; pad = layer.padding
+        kH, kW = size(layer.weights.data, 3), size(layer.weights.data, 4)
         
-        # grad W - USAR cdims
-        if layer.weights.requires_grad
-            g_w_hwio = try
-                NNlib.∇conv_filter(x_hwcn, dy_hwcn, cdims)  # Pasar cdims
-            catch
-                # Fallback manual...
+        # AGREGAR: Crear ConvDims para los gradientes
+        # Necesitamos las dimensiones de entrada
+        H_in = size(x_hwcn, 1)
+        W_in = size(x_hwcn, 2)
+        cdims = NNlib.DenseConvDims(x_hwcn, w_hwio;
+                                stride=stride, padding=pad, dilation=(1,1))
+        
+        out.backward_fn = grad -> begin
+            dy = grad isa TensorEngine.Tensor ? grad.data : grad
+            dy_hwcn = permutedims(on_gpu ? dy : Array(dy), (3,4,2,1))
+            
+            # grad W - USAR cdims
+            if layer.weights.requires_grad
+                g_w_hwio = try
+                    NNlib.∇conv_filter(x_hwcn, dy_hwcn, cdims)  # Pasar cdims
+                catch
+                    # Fallback manual...
                     # Fallback: calcular manualmente el gradiente de pesos
                     # Para cada peso, su gradiente es la correlación entre
                     # la entrada y el gradiente de salida
@@ -168,9 +168,9 @@ function (layer::Conv2D)(input::TensorEngine.Tensor)
                 TensorEngine.backward(layer.weights,
                                       TensorEngine.Tensor(on_gpu ? CUDA.CuArray(g_w) : g_w;
                                                           requires_grad=false))
-            end
+            end  # CERRAR AQUÍ EL IF DE WEIGHTS
 
-            # grad bias
+            # grad bias - MOVIDO FUERA del if de weights
             if layer.bias.requires_grad
                 g_b = sum(dy, dims=(1,3,4))
                 TensorEngine.backward(layer.bias,
@@ -178,7 +178,7 @@ function (layer::Conv2D)(input::TensorEngine.Tensor)
                                                           requires_grad=false))
             end
 
-            # grad input - TAMBIÉN CORREGIR conv_data
+            # grad input - TAMBIÉN MOVIDO FUERA del if de weights
             if input.requires_grad
                 g_x_hwcn = try
                     NNlib.∇conv_data(dy_hwcn, w_hwio, cdims)  # Pasar cdims
@@ -203,8 +203,9 @@ function (layer::Conv2D)(input::TensorEngine.Tensor)
                                       TensorEngine.Tensor(on_gpu ? CUDA.CuArray(g_x) : g_x;
                                                           requires_grad=false))
             end
-        end
-    end
+        end  # Fin backward_fn
+    end  # Fin if needs_grad
+    
     return out
 end
 
@@ -235,75 +236,90 @@ end
 ###############################################
 #   forward / backward
 ###############################################
-function (layer::MaxPooling)(input::TensorEngine.Tensor)
+function conv_forward(layer::MaxPooling, input::TensorEngine.Tensor)
+    x = input.data  # (N, C, H, W)
+    x_cpu = x isa CUDA.CuArray ? Array(x) : x  # ✅ Para evitar scalar indexing
 
-    ## -------- forward --------
-    x_nchw = input.data                       # (N,C,H,W) — conv estándar
-    x_hwcn = permutedims(x_nchw, (3,4,2,1))   # (H,W,C,N) — formato NNlib
+    kH, kW = layer.pool_size
+    sH, sW = layer.stride
+    pH, pW = layer.padding
 
-    y_hwcn = NNlib.maxpool(
-        x_hwcn, layer.pool_size;
-        stride = layer.stride,
-        pad    = layer.padding
-    )
+    N, C, H_in, W_in = size(x)
+    H_out = div(H_in + 2*pH - kH, sH) + 1
+    W_out = div(W_in + 2*pW - kW, sW) + 1
 
-    y_nchw = permutedims(y_hwcn, (4,3,1,2))   # de vuelta a (N,C,H',W')
+    output = zeros(Float32, N, C, H_out, W_out)
+    max_indices = zeros(Int, N, C, H_out, W_out, 2)  # (h,w)
 
-    out = TensorEngine.Tensor(
-        y_nchw;
-        requires_grad = input.requires_grad       # ⧉ propaga flag
-    )
+    for n in 1:N, c in 1:C
+        for h_out in 1:H_out, w_out in 1:W_out
+            h_start = (h_out - 1) * sH + 1 - pH
+            w_start = (w_out - 1) * sW + 1 - pW
 
-    ## -------- backward --------
-    if out.requires_grad
-        # capturamos cosas que la closure necesita
-        pool   = layer.pool_size
-        stride = layer.stride
-        pad    = layer.padding
+            max_val = -Inf32
+            max_h, max_w = 0, 0
 
-        out.backward_fn = Δ -> begin
-            Δ_nchw = Δ isa TensorEngine.Tensor ? Δ.data : Δ
-            Δ_hwcn = permutedims(Δ_nchw, (3,4,2,1))
+            for kh in 1:kH, kw in 1:kW
+                h_in = h_start + kh - 1
+                w_in = w_start + kw - 1
 
-            # 1️⃣  intento rápido: usar API de NNlib si existe
-            grad_x_hwcn = try
-                NNlib.∇maxpool(Δ_hwcn, y_hwcn, x_hwcn, pool;
-                               stride = stride, pad = pad)
-            catch
-                # 2️⃣  fallback: máscara del máximo (CPU) --------------
-                grad_cpu = zeros(Float32, size(x_hwcn))
-                H_out, W_out, C, N = size(y_hwcn)
-                ph, pw = pool
-                sh, sw = stride
-                for n in 1:N, c in 1:C, h in 1:H_out, w in 1:W_out
-                    h0 = (h-1)*sh + 1
-                    w0 = (w-1)*sw + 1
-                    h1 = min(h0+ph-1, size(x_hwcn,1))
-                    w1 = min(w0+pw-1, size(x_hwcn,2))
-                    window = @view x_hwcn[h0:h1, w0:w1, c, n]
-                    # pos máx local
-                    maxidx = findmax(window)[2]
-                    grad_cpu[h0:h1, w0:w1, c, n][maxidx] += Δ_hwcn[h,w,c,n]
+                if h_in >= 1 && h_in <= H_in && w_in >= 1 && w_in <= W_in
+                    val = x_cpu[n, c, h_in, w_in]  # ✅ usamos CPU-safe acceso
+                    if val > max_val
+                        max_val = val
+                        max_h, max_w = h_in, w_in
+                    end
                 end
-                # si input estaba en GPU, subimos el gradiente
-                x_hwcn isa CUDA.CuArray ? CUDA.CuArray(grad_cpu) : grad_cpu
             end
 
-            grad_x_nchw = permutedims(grad_x_hwcn, (4,3,1,2))
-
-            TensorEngine.backward(
-                input,
-                TensorEngine.Tensor(
-                    TensorEngine.ensure_compatible(grad_x_nchw, input.data);
-                    requires_grad = false
-                )
-            )
+            output[n, c, h_out, w_out] = max_val
+            max_indices[n, c, h_out, w_out, 1] = max_h
+            max_indices[n, c, h_out, w_out, 2] = max_w
         end
     end
+
+    if x isa CUDA.CuArray
+        output = CUDA.CuArray(output)
+        max_indices = CUDA.CuArray(max_indices)
+    end
+
+    out = TensorEngine.Tensor(output)
+
+    out.backward_fn = grad -> begin
+        grad_data_raw = grad isa TensorEngine.Tensor ? grad.data : grad
+        grad_data = grad_data_raw isa CUDA.CuArray ? Array(grad_data_raw) : grad_data_raw
+
+        grad_input = zeros(Float32, size(x))
+
+        max_indices_cpu = max_indices isa CUDA.CuArray ? Array(max_indices) : max_indices
+
+        for n in 1:N, c in 1:C
+            for h_out in 1:H_out, w_out in 1:W_out
+                h_in = max_indices_cpu[n, c, h_out, w_out, 1]
+                w_in = max_indices_cpu[n, c, h_out, w_out, 2]
+
+                if h_in > 0 && w_in > 0
+                    grad_input[n, c, h_in, w_in] += grad_data[n, c, h_out, w_out]
+                end
+            end
+        end
+
+        if x isa CUDA.CuArray
+            grad_input = CUDA.CuArray(grad_input)
+        end
+
+        TensorEngine.backward(input, TensorEngine.Tensor(grad_input))
+    end
+
+
 
     return out
 end
 
+
+function (layer::MaxPooling)(input::TensorEngine.Tensor)
+    return conv_forward(layer, input)
+end
 
 
 # ---------------------------------------------------------------------------

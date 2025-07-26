@@ -9,47 +9,73 @@ export create_resnet, create_simple_cnn
 """
 Crea un modelo ResNet con el número especificado de bloques y clases
 """
-function create_resnet(input_channels=3, num_classes=2; blocks=[2,2,2,2])
+function create_resnet(input_channels::Int=3, num_classes::Int=2; 
+                      blocks::Vector{Int}=[2,2,2,2], input_size::Int=224)
+    
     layers = AbstractLayer.Layer[]
     
-    # Debug
-    println("Creating ResNet with input channels: $input_channels")
+    # Validar entradas
+    @assert input_channels > 0 "input_channels debe ser positivo"
+    @assert num_classes > 0 "num_classes debe ser positivo"
+    @assert all(b > 0 for b in blocks) "Todos los bloques deben ser positivos"
+    @assert input_size > 0 "input_size debe ser positivo"
     
-    # Capa de entrada
+    # Rastrear dimensiones espaciales
+    current_spatial_dim = input_size
+    
+    # Capa inicial
     initial_channels = 64
-    println("Initial conv: $input_channels -> $initial_channels")
-    push!(layers, Conv2D(input_channels, initial_channels, (7,7), stride=(2,2), padding=(3,3)))
+    push!(layers, Conv2D(input_channels, initial_channels, (7,7), 
+                        stride=(2,2), padding=(3,3)))
+    current_spatial_dim = compute_conv_output_dim(current_spatial_dim, 7, 2, 3)
+    
     push!(layers, BatchNorm(initial_channels))
     push!(layers, LayerActivation(relu))
+    
+    # MaxPooling
     push!(layers, MaxPooling((3,3), stride=(2,2), padding=(1,1)))
+    current_spatial_dim = div(current_spatial_dim + 2*1 - 3, 2) + 1
     
     # Bloques residuales
     in_channels = initial_channels
-    for (i, block_count) in enumerate(blocks)
-        out_channels = initial_channels * (2^(i-1))
-        println("Block section $i: $in_channels -> $out_channels")
+    
+    for (stage_idx, block_count) in enumerate(blocks)
+        out_channels = initial_channels * (2^(stage_idx-1))
         
-        stride = i > 1 ? 2 : 1
-        println("  First block: stride=$stride")
+        # Primer bloque de cada etapa puede reducir dimensiones
+        stride = stage_idx > 1 ? 2 : 1
+        
+        # Crear primer bloque
         push!(layers, create_residual_block(in_channels, out_channels, stride))
         
-        for j in 2:block_count
-            println("  Block $j: $out_channels -> $out_channels")
+        if stride == 2
+            current_spatial_dim = compute_conv_output_dim(current_spatial_dim, 3, stride, 1)
+        end
+        
+        # Resto de bloques mantienen dimensiones
+        for _ in 2:block_count
             push!(layers, create_residual_block(out_channels, out_channels, 1))
         end
         
         in_channels = out_channels
     end
     
-    # Cabeza de clasificación
-    println("Final layers: GlobalAvgPool -> $in_channels -> $num_classes")
+    # Pooling global adaptativo
     push!(layers, GlobalAvgPool())
     push!(layers, Flatten())
+    
+    # Capas finales
     push!(layers, DropoutLayer(Float32(0.5)))
     push!(layers, Dense(in_channels, num_classes))
     push!(layers, LayerActivation(softmax))
     
     return Sequential(layers)
+end
+
+# Helper function
+function compute_conv_output_dim(input_dim::Int, kernel_size::Int, 
+                                stride::Int, padding::Int)
+    return div(input_dim + 2*padding - kernel_size, stride) + 1
 end
 
 """
