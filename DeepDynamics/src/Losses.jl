@@ -1,84 +1,112 @@
 module Losses
 using ..TensorEngine
 using CUDA
-
-export binary_crossentropy, categorical_crossentropy
+using Statistics
+using NNlib: σ
+export binary_crossentropy, categorical_crossentropy, binary_crossentropy_with_logits
 
 """
     binary_crossentropy(y_pred, y_true)
 
-Calcula la pérdida de entropía cruzada binaria.
+Calcula la pérdida de entropía cruzada binaria con soporte CPU/GPU.
 """
-function binary_crossentropy(y_pred::TensorEngine.Tensor, y_true::TensorEngine.Tensor)
-    # Detectar si estamos en GPU o CPU
-    is_on_gpu = (y_pred.data isa CUDA.CuArray)
-    
-    # Asegurar que ambos tensores estén en el mismo dispositivo y tengan el mismo tipo
-    y_pred_data = y_pred.data
+function binary_crossentropy(
+    y_pred::TensorEngine.Tensor,
+    y_true::TensorEngine.Tensor
+)
+    # 1) Asegurar mismo dispositivo
+    is_on_gpu   = (y_pred.data isa CUDA.CuArray)
     y_true_data = y_true.data
-    
-    # Obtener el tipo de datos (Float32/Float64)
-    data_type = eltype(y_pred_data)
-    
     if is_on_gpu && !(y_true_data isa CUDA.CuArray)
-        y_true_data = CUDA.CuArray{data_type}(convert.(data_type, y_true_data))
+        y_true_data = CUDA.CuArray(y_true_data)
     elseif !is_on_gpu && (y_true_data isa CUDA.CuArray)
-        y_true_data = Array{data_type}(convert.(data_type, Array(y_true_data)))
-    else
-        # Asegurar que ambos tengan el mismo tipo de datos
-        if eltype(y_true_data) != data_type
-            if is_on_gpu
-                y_true_data = CUDA.CuArray{data_type}(convert.(data_type, Array(y_true_data)))
-            else
-                y_true_data = convert.(data_type, y_true_data)
-            end
-        end
+        y_true_data = Array(y_true_data)
     end
-    
-    # Calculamos la pérdida con estabilidad numérica
-    epsilon = convert(data_type, 1e-7)
-    p = clamp(y_pred_data[1,1], epsilon, 1 - epsilon)
-    loss_val = -(y_true_data[1,1] * log(p) + (1 - y_true_data[1,1]) * log(1 - p))
-    
-    # Crear tensor de resultado en el mismo dispositivo y tipo
-    result_data = if is_on_gpu 
-        CUDA.fill(loss_val, (1,1))
-    else
-        reshape([loss_val], (1,1))
-    end
-    
-    result = TensorEngine.Tensor(result_data)
-    
-    # Solo asignar backward_fn si y_pred requiere gradientes
+
+    # 2) Forward: BCE elemento a elemento
+    ε = 1f-7
+    p_clipped = clamp.(y_pred.data, ε, 1f0 - ε)
+    elems = -(
+        y_true_data .* log.(p_clipped) .+
+        (1f0 .- y_true_data) .* log.(1f0 .- p_clipped)
+    )
+    # Promedio
+    N = length(elems)
+    loss_val = sum(elems) / N
+
+    # 3) Crear tensor de salida
+    result = TensorEngine.Tensor(reshape([loss_val], (1,1)); requires_grad=true)
+
+    # 4) Backward: (p - y) / N
     if y_pred.requires_grad
-        result.backward_fn = grad -> begin
-            # Manejar tanto escalares como arrays
-            grad_val = if grad isa AbstractArray
-                length(grad) == 1 ? grad[1] : error("Gradiente debe ser escalar")
-            else
-                grad
-            end
-            
-            # Asegurar que grad_val tiene el tipo correcto
-            grad_val = convert(data_type, grad_val)
-            
-            # Calcular gradiente
-            dLdp = -(y_true_data[1,1] / p - (1 - y_true_data[1,1]) / (1 - p))
-            
-            # Preparar el tensor de gradiente en el dispositivo y tipo correctos
-            if is_on_gpu
-                grad_tensor = TensorEngine.Tensor(CUDA.fill(grad_val * dLdp, size(y_pred_data)))
-            else
-                grad_tensor = TensorEngine.Tensor(fill(grad_val * dLdp, size(y_pred_data)))
-            end
-            
-            # Propagar gradiente
-            TensorEngine.backward(y_pred, grad_tensor)
+        result.backward_fn = function(grad)
+            gs = grad isa Number ? grad : grad[1]
+            grad_input = (y_pred.data .- y_true_data) .* gs ./ N
+            TensorEngine.backward(y_pred, TensorEngine.Tensor(grad_input))
         end
     end
-    
+
     return result
 end
+
+
+# En tu módulo de pérdidas (p. ej. `Losses.jl`)
+
+"""
+    binary_crossentropy_with_logits(logits::Tensor, targets::Tensor)
+
+Pérdida de entropía cruzada binaria en logits (capa lineal) con soporte CPU/GPU.
+Forward:
+  L = mean( max(z,0) - z⋅y + log(1 + exp(-|z|)) )
+Backward implícita en el grafo:
+  dL/dz = sigmoid(z) .- y
+"""
+function binary_crossentropy_with_logits(
+    logits::TensorEngine.Tensor,
+    y_true::TensorEngine.Tensor
+)
+    # ---- 1) Asegurar mismo dispositivo ----
+    is_on_gpu = (logits.data isa CUDA.CuArray)
+    t = y_true.data
+    if is_on_gpu && !(t isa CUDA.CuArray)
+        t = CUDA.CuArray(t)
+    elseif !is_on_gpu && (t isa CUDA.CuArray)
+        t = Array(t)
+    end
+
+    # ---- 2) Cómputo numéricamente estable ----
+    z = logits.data
+    # max(z,0)    → clamp.(z, 0, Inf)
+    # log(1+e^{-abs(z)})
+    absz = abs.(z)
+    log_term = log.(1f0 .+ exp.(-absz))
+    max_term = clamp.(z, 0f0, Inf)
+
+    loss_elems = max_term .- z .* t .+ log_term
+    loss_val = sum(loss_elems) / length(loss_elems)
+
+    # ---- 3) Tensor resultado ----
+    result = TensorEngine.Tensor(reshape([loss_val], (1,1));
+                                 requires_grad=true)
+
+    if logits.requires_grad
+        result.backward_fn = function(grad)
+            # grad puede ser escalar o Tensor 1×1
+            gs = grad isa Number ? grad : grad[1]
+            N  = length(z)
+            σz = 1f0 ./ (1f0 .+ exp.(-z))
+            # ∂L/∂z = (σ(z) - y) / N
+            grad_input = (σz .- t) .* (gs / N)
+            TensorEngine.backward(logits,
+                TensorEngine.Tensor(grad_input))
+        end
+    end
+
+    return result
+end
+
+
+
 
 """
     categorical_crossentropy(y_pred, y_true)

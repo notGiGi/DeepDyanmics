@@ -1,5 +1,5 @@
 module Training
-
+using Printf
 using ..TensorEngine
 using ..NeuralNetwork
 using ..Optimizers
@@ -7,85 +7,401 @@ using ..Visualizations
 using ..GPUMemoryManager  # Nuevo import para gestión de memoria
 using ..DataLoaders       # Nuevo import para DataLoaders optimizados
 using ..Utils: set_training_mode!
+using ..Callbacks: AbstractCallback, EarlyStopping, FinalReportCallback,
+                   on_epoch_end, on_train_end
+                   # Al inicio del módulo Training, después de using ..Callbacks
+using ..Callbacks: on_epoch_begin, on_epoch_end, on_train_begin, on_train_end, 
+                   on_batch_begin, on_batch_end, PrintCallback
+using ..Losses
 using Random
 using LinearAlgebra
 using CUDA
+using Statistics
+using ..Utils
 import ..Optimizers: step!
 export train!, train_batch!, compute_accuracy_general, train_improved!,
-       EarlyStopping, Callback, PrintCallback, FinalReportCallback, add_callback!, 
-       run_epoch_callbacks, run_final_callbacks, train_with_loaders, stack_batch, evaluate_model
+       EarlyStopping, PrintCallback, FinalReportCallback, add_callback!,  # Estos ahora vienen de Callbacks
+       run_epoch_callbacks, run_final_callbacks, 
+       train_with_loaders, stack_batch, evaluate_model, 
+       fit!, History
+using ..Metrics: accuracy, mae, rmse, binary_accuracy
+const optim_step! = Optimizers.step!
+   
 
 
+  
 
 # -----------------------------------------------------------------------
 # Estructuras de EarlyStopping, Callbacks, etc.
 # -----------------------------------------------------------------------
+const callbacks = AbstractCallback[]
 
-
-mutable struct EarlyStopping
-    patience::Int
-    min_delta::Float64
-    best_loss::Float64
-    wait::Int
-    stopped::Bool
-    function EarlyStopping(; patience::Int = 5, min_delta::Float64 = 0.0)
-        new(patience, min_delta, Inf, 0, false)
+# Función auxiliar para calcular métricas
+function compute_metric(metric::Symbol, y_pred::Tensor, y_true::Tensor)
+    y_pred_cpu = y_pred.data isa CUDA.CuArray ? Array(y_pred.data) : y_pred.data
+    y_true_cpu = y_true.data isa CUDA.CuArray ? Array(y_true.data) : y_true.data
+    
+    if metric == :accuracy
+        # Para clasificación multiclase
+        if size(y_pred_cpu, 1) > 1
+            pred_classes = vec(argmax(y_pred_cpu, dims=1))
+            true_classes = vec(argmax(y_true_cpu, dims=1))
+            return sum(pred_classes .== true_classes) / length(true_classes)
+        else
+            # Para clasificación binaria
+            return binary_accuracy(vec(y_pred_cpu), vec(Int.(y_true_cpu .> 0.5)))
+        end
+    elseif metric == :mae
+        return mae(vec(y_pred_cpu), vec(y_true_cpu))
+    elseif metric == :rmse
+        return rmse(vec(y_pred_cpu), vec(y_true_cpu))
+    else
+        # Si no se reconoce la métrica, devolver 0
+        @warn "Métrica no reconocida: $metric"
+        return 0.0f0
     end
 end
 
 function should_stop_early!(es::EarlyStopping, val_loss::Float64)
-    if val_loss < es.best_loss - es.min_delta
-        es.best_loss = val_loss
-        es.wait = 0
-    else
-        es.wait += 1
-    end
-    if es.wait ≥ es.patience
-        es.stopped = true
-    end
+    # Crear logs falsos para usar la nueva interfaz
+    logs = Dict(:val_loss => val_loss)
+    on_epoch_end(es, 0, logs)  # epoch 0 es dummy
+    return es.stopped
 end
 
-abstract type Callback end
 
-struct PrintCallback <: Callback
-    freq::Int
-end
 
-function on_epoch_end(cb::PrintCallback, epoch::Int, train_loss, val_loss, train_acc, val_acc)
-    println("Epoch $epoch: Training Loss = $(round(train_loss, digits=4)), Validation Loss = $(round(val_loss, digits=4)), Training Accuracy = $(round(train_acc*100, digits=2))%, Validation Accuracy = $(round(val_acc*100, digits=2))%")
-end
-
-struct FinalReportCallback <: Callback
-    output_format::Symbol
-    filename::String
-end
-
-function on_training_end(cb::FinalReportCallback, train_losses::Vector{Float64}, val_losses::Vector{Float64})
-    Reports.generate_report(train_losses, val_losses; output_format=cb.output_format, filename=cb.filename)
-    println("Final report generated and saved to ", cb.filename)
-end
-
-const callbacks = Callback[]
-
-function add_callback!(cb::Callback)
+function add_callback!(cb)  # Sin especificar tipo
     push!(callbacks, cb)
 end
 
+# Función para limpiar callbacks si es necesario
+function clear_callbacks!()
+    empty!(callbacks)
+end
+
+# Funciones de compatibilidad actualizadas
 function run_epoch_callbacks(epoch::Int, train_loss, val_loss, train_acc, val_acc)
+    logs = Dict(
+        :loss => train_loss,
+        :val_loss => val_loss,
+        :train_accuracy => train_acc,
+        :val_accuracy => val_acc
+    )
+    
     for cb in callbacks
-        if cb isa PrintCallback
-            on_epoch_end(cb, epoch, train_loss, val_loss, train_acc, val_acc)
+        try
+            # Intentar la nueva interfaz
+            on_epoch_end(cb, epoch, logs)
+        catch
+            # Si falla, intentar la interfaz antigua
+            if hasproperty(cb, :on_epoch_end)
+                on_epoch_end(cb, epoch, train_loss, val_loss, train_acc, val_acc)
+            end
         end
     end
 end
 
 function run_final_callbacks(train_losses::Vector{Float64}, val_losses::Vector{Float64})
+    logs = Dict(
+        :train_losses => train_losses,
+        :val_losses => val_losses
+    )
+    
     for cb in callbacks
-        if cb isa FinalReportCallback
-            on_training_end(cb, train_losses, val_losses)
+        try
+            on_train_end(cb, logs)
+        catch
+            # Compatibilidad con interfaz antigua si es necesario
+            if cb isa FinalReportCallback
+                on_training_end(cb, train_losses, val_losses)
+            end
         end
     end
 end
+
+
+
+# Función auxiliar para asegurar que un tensor esté en el dispositivo correcto
+function ensure_tensor_on_device(tensor::Tensor, device::Symbol)
+    current_device = tensor.data isa CUDA.CuArray ? :gpu : :cpu
+    if current_device != device
+        if device == :gpu
+            return TensorEngine.to_gpu(tensor)
+        else
+            return TensorEngine.to_cpu(tensor)
+        end
+    end
+    return tensor
+end
+
+
+# Historia para almacenar métricas
+mutable struct History
+    train_loss::Vector{Float32}
+    val_loss::Vector{Float32}
+    train_metrics::Dict{String, Vector{Float32}}
+    val_metrics::Dict{String, Vector{Float32}}
+    epochs::Int
+    
+    History() = new(Float32[], Float32[], Dict{String, Vector{Float32}}(), 
+                    Dict{String, Vector{Float32}}(), 0)
+end
+
+"""
+    fit!(model, X_train, y_train; kwargs...)
+
+Entrena el modelo con una interfaz moderna y completa.
+"""
+function fit!(model::Sequential, X_train::Vector{<:Tensor}, y_train::Vector{<:Tensor};
+              X_val=nothing, y_val=nothing,
+              optimizer=Adam(0.001f0),
+              loss_fn=mse_loss,
+              epochs::Int=10,
+              batch_size::Int=32,
+              validation_split::Float32=0.2f0,
+              shuffle::Bool=true,
+              callbacks::AbstractVector{<:AbstractCallback}=AbstractCallback[],
+              verbose::Bool=true,
+              metrics::Vector{Symbol}=[:accuracy])
+    
+    # Validación de inputs
+    @assert length(X_train) == length(y_train) "X_train y y_train deben tener el mismo tamaño"
+    @assert 0 <= validation_split < 1 "validation_split debe estar en [0, 1)"
+    callbacks = Vector{AbstractCallback}(callbacks)
+    # Si piden verbose, añadimos un PrintCallback al frente
+        # Agregar PrintCallback si verbose es true y no hay ninguno
+    if verbose && !any(cb isa PrintCallback for cb in callbacks)
+        pushfirst!(callbacks, PrintCallback(1))
+    end
+
+    # Auto-split si no hay validación explícita
+    if X_val === nothing && validation_split > 0
+        n_samples = length(X_train)
+        n_val = round(Int, n_samples * validation_split)
+        n_train = n_samples - n_val
+        
+        indices = shuffle ? Random.shuffle(1:n_samples) : (1:n_samples)
+        
+        train_indices = indices[1:n_train]
+        val_indices = indices[n_train+1:end]
+        
+        X_val = X_train[val_indices]
+        y_val = y_train[val_indices]
+        
+        X_train_split = X_train[train_indices]
+        y_train_split = y_train[train_indices]
+    else
+        X_train_split = X_train
+        y_train_split = y_train
+    end
+    
+
+    
+    # Crear DataLoaders
+    train_loader = DataLoader(X_train_split, y_train_split, batch_size; shuffle=shuffle)
+    val_loader = if X_val !== nothing && y_val !== nothing
+        DataLoader(X_val, y_val, batch_size; shuffle=false)
+    else
+        nothing
+    end
+    
+    # Inicializar historia y parámetros
+    history = History()
+    params = collect_parameters(model)
+    
+    # Logs globales para callbacks
+    logs = Dict{Symbol, Any}(
+        :model => model,
+        :optimizer => optimizer,
+        :params => params,
+        :train_losses => Float64[],
+        :val_losses => Float64[]
+    )
+    
+    # on_train_begin
+    for cb in callbacks
+        on_train_begin(cb, logs)
+    end
+    
+    # Loop de entrenamiento
+    for epoch in 1:epochs
+        epoch_start_time = time()
+        
+        # Modo training
+        set_training_mode!(model, true)
+        
+        # Logs de época - CORREGIDO
+        epoch_logs = Dict{Symbol, Any}(
+            :model => model,
+            :optimizer => optimizer,
+            :params => params,
+            :epoch => epoch
+        )
+        
+        # on_epoch_begin
+        for cb in callbacks
+            on_epoch_begin(cb, epoch, epoch_logs)
+        end
+        
+        # === FASE DE ENTRENAMIENTO ===
+        train_loss_sum = 0.0f0
+        train_metric_sums = Dict{Symbol, Float32}(m => 0.0f0 for m in metrics)  # YA CORREGIDO
+        train_batches = 0
+        
+        for (batch_idx, (batch_X, batch_y)) in enumerate(train_loader)
+            # CORREGIDO: especificar tipo Any
+            batch_logs = Dict{Symbol, Any}(:batch => batch_idx, :size => length(batch_X))
+            
+            # on_batch_begin
+            for cb in callbacks
+                on_batch_begin(cb, batch_idx, batch_logs)
+            end
+            
+            # Zero gradients
+            for p in params
+                zero_grad!(p)
+            end
+            
+            # Stack batch
+            device = model_device(model)
+            X_batch = stack_batch([ensure_tensor_on_device(x, device) for x in batch_X])
+            y_batch = stack_batch([ensure_tensor_on_device(y, device) for y in batch_y])
+            
+            # Forward
+            y_pred = forward(model, X_batch)
+            
+            # Loss
+            loss = loss_fn(y_pred, y_batch)
+            train_loss_sum += loss.data[1]
+            
+            # Backward
+            backward(loss, [1.0f0])
+            
+            # Update
+            optim_step!(optimizer, params)
+            
+            # Métricas
+            for metric in metrics
+                value = compute_metric(metric, y_pred, y_batch)
+                train_metric_sums[metric] += value
+            end
+            
+            train_batches += 1
+            
+            # on_batch_end - ESTA LÍNEA YA NO DARÁ ERROR
+            batch_logs[:loss] = loss.data[1]
+            for cb in callbacks
+                on_batch_end(cb, batch_idx, batch_logs)
+            end
+        end
+        
+        # Promediar métricas de entrenamiento
+        avg_train_loss = train_loss_sum / train_batches
+        push!(history.train_loss, avg_train_loss)
+        push!(logs[:train_losses], Float64(avg_train_loss))
+        epoch_logs[:loss] = avg_train_loss
+        
+        for metric in metrics
+            avg_value = train_metric_sums[metric] / train_batches
+            if !haskey(history.train_metrics, string(metric))
+                history.train_metrics[string(metric)] = Float32[]
+            end
+            push!(history.train_metrics[string(metric)], avg_value)
+            epoch_logs[Symbol("train_$metric")] = avg_value
+        end
+        
+        # === FASE DE VALIDACIÓN ===
+        if val_loader !== nothing
+            set_training_mode!(model, false)
+            
+            val_loss_sum = 0.0f0
+            val_metric_sums = Dict{Symbol, Float32}(m => 0.0f0 for m in metrics)  # YA CORREGIDO
+            val_batches = 0
+            
+            for (batch_X, batch_y) in val_loader
+                # Stack batch - CORREGIDO
+                device = model_device(model)
+                X_batch = stack_batch([ensure_tensor_on_device(x, device) for x in batch_X])
+                y_batch = stack_batch([ensure_tensor_on_device(y, device) for y in batch_y])
+                
+                # Forward sin gradientes
+                y_pred = forward(model, X_batch)
+                
+                # Loss
+                loss = loss_fn(y_pred, y_batch)
+                val_loss_sum += loss.data[1]
+                
+                # Métricas
+                for metric in metrics
+                    value = compute_metric(metric, y_pred, y_batch)
+                    val_metric_sums[metric] += value
+                end
+                
+                val_batches += 1
+            end
+            
+            # Promediar métricas de validación
+            avg_val_loss = val_loss_sum / val_batches
+            push!(history.val_loss, avg_val_loss)
+            push!(logs[:val_losses], Float64(avg_val_loss))
+            epoch_logs[:val_loss] = avg_val_loss
+            
+            for metric in metrics
+                avg_value = val_metric_sums[metric] / val_batches
+                if !haskey(history.val_metrics, string(metric))
+                    history.val_metrics[string(metric)] = Float32[]
+                end
+                push!(history.val_metrics[string(metric)], avg_value)
+                epoch_logs[Symbol("val_$metric")] = avg_value
+            end
+        end
+        
+        # Tiempo de época
+        epoch_time = time() - epoch_start_time
+        epoch_logs[:time] = epoch_time
+        
+        # on_epoch_end
+        for cb in callbacks
+            on_epoch_end(cb, epoch, epoch_logs)
+        end
+        
+        # Verificar early stopping
+        for cb in callbacks
+            if cb isa EarlyStopping && cb.stopped
+                history.epochs = epoch
+                # on_train_end para todos los callbacks
+                for cb2 in callbacks
+                    on_train_end(cb2, logs)
+                end
+                return history
+            end
+        end
+        
+        history.epochs = epoch
+        
+        # Limpiar memoria GPU
+        if CUDA.functional()
+            GPUMemoryManager.clear_cache()
+            GC.gc()
+            CUDA.reclaim()
+        end
+    end
+    
+    # on_train_end
+    for cb in callbacks
+        on_train_end(cb, logs)
+    end
+    
+    return history
+end
+
+
+
+
+
+
+
 
 # -----------------------------------------------------------------------
 # Función de stacking optimizada para GPU
@@ -169,6 +485,7 @@ function stack_batch(batch::Vector{<:TensorEngine.Tensor})
         
         return TensorEngine.Tensor(stacked_data)
         
+  
     elseif nd == 1 || nd == 2  # Etiquetas
         if is_on_gpu
             # GPU: concatenar en dimensión 2 para mantener formato (features, batch)
@@ -320,9 +637,7 @@ function _process_batch(batch_idxs, train_inputs, train_targets, model, loss_fn)
     loss = loss_fn(output, label_batch)
     
     # Backpropagation
-    if loss.backward_fn !== nothing
-        loss.backward_fn(ones(size(loss.data)))
-    end
+    TensorEngine.backward(loss, ones(size(loss.data)))
     
     return loss.data[1]
 end
@@ -458,11 +773,266 @@ function train_batch!(model::NeuralNetwork.Sequential, optimizer, loss_fn::Funct
     return train_losses, val_losses, epochs
 end
 
-# -----------------------------------------------------------------------
-# Alias para train!
-# -----------------------------------------------------------------------
-train!(args...; kwargs...) = train_batch!(args...; kwargs...)
+# Agregar al módulo Training en Training.jl
 
+"""
+    train!(model, X, y; kwargs...) -> Dict
+
+Entrena un modelo con datos X,y usando configuración especificada.
+
+# Argumentos
+- `model`: Modelo Sequential a entrenar
+- `X`: Datos de entrada (Array o Vector de Tensors)
+- `y`: Etiquetas objetivo (Array o Vector de Tensors)
+
+# Kwargs
+- `optimizer`: Optimizador a usar (default: Adam(learning_rate=0.001))
+- `loss_fn`: Función de pérdida (default: mse_loss)
+- `epochs`: Número de épocas (default: 10)
+- `batch_size`: Tamaño del batch (default: 32)
+- `verbose`: Mostrar progreso (default: true)
+- `metrics`: Vector de métricas a calcular (default: [])
+
+# Retorna
+Dict con historial: {loss: Vector{Float64}, metrics: Dict{Symbol, Vector{Float64}}}
+"""
+function train!(model, X, y; 
+    optimizer=nothing,
+    loss_fn=TensorEngine.mse_loss,
+    epochs::Int=10,
+    batch_size::Int=32,
+    verbose::Bool=true,
+    metrics::Vector=[])
+    
+    # Si no se proporciona optimizador, usar Adam por defecto
+    if optimizer === nothing
+        optimizer = Optimizers.Adam(learning_rate=0.001)
+    end
+    
+    # Validación de entrada
+    _validate_training_inputs(X, y)
+    
+    # Preparar datos como tensores
+    X_tensors = _prepare_tensors(X)
+    y_tensors = _prepare_tensors(y)
+    
+    # Detectar dispositivo del modelo
+    model_dev = NeuralNetwork.model_device(model)
+    use_gpu = (model_dev == :gpu)
+    
+    # Mover datos al dispositivo correcto
+    if use_gpu
+        X_tensors = [TensorEngine.to_gpu(t) for t in X_tensors]
+        y_tensors = [TensorEngine.to_gpu(t) for t in y_tensors]
+    end
+    
+    # ------------------------------------------------------
+    # Para clasificación binaria con logits, usar full-batch
+    # ------------------------------------------------------
+    n_samples = length(X_tensors)
+    if loss_fn === binary_crossentropy_with_logits
+        batch_size = n_samples
+    end
+    # Recolectar parámetros
+    params = NeuralNetwork.collect_parameters(model)
+    
+    # Inicializar historial
+    history = Dict(
+        :loss => Float64[],
+        :metrics => Dict{Symbol, Vector{Float64}}()
+    )
+    
+    # Inicializar métricas en historial
+    for metric in metrics
+        metric_name = Symbol(nameof(metric))
+        history[:metrics][metric_name] = Float64[]
+    end
+    
+    # Calcular número de batches
+     n_batches = cld(n_samples, batch_size)
+
+    
+    # Training loop
+    for epoch in 1:epochs
+        epoch_start = time()
+        epoch_loss = 0.0
+        batch_count = 0
+        
+        # Shuffle de índices
+        indices = Random.shuffle(1:n_samples)
+        
+        # Progress tracking
+        verbose && println("\nEpoch $epoch/$epochs")
+        
+        # Procesar batches
+        for batch_idx in 1:n_batches
+            # Obtener índices del batch
+            start_idx = (batch_idx - 1) * batch_size + 1
+            end_idx = min(batch_idx * batch_size, n_samples)
+            batch_indices = indices[start_idx:end_idx]
+            
+            # Preparar batch - usar Vector{Tensor} como espera train_batch!
+            batch_X_tensors = X_tensors[batch_indices]
+            batch_y_tensors = y_tensors[batch_indices]
+            
+            batch_X = stack_batch(batch_X_tensors)
+            batch_y = stack_batch(batch_y_tensors)
+
+            # Limpiar gradientes
+            for param in params
+                TensorEngine.zero_grad!(param)
+            end
+
+            # Forward pass
+            output = NeuralNetwork.forward(model, batch_X)
+
+            # Compute loss: si es BCE tras Activation, usar logits‐BCE
+            if loss_fn === binary_crossentropy &&
+               isa(model, Sequential) &&
+               isa(model.layers[end], Activation)
+
+                # submodelo sin la última sigmoid
+                submodel = Sequential(model.layers[1:end-1])
+                logits   = NeuralNetwork.forward(submodel, batch_X)
+                loss     = binary_crossentropy_with_logits(logits, batch_y)
+            else
+                loss     = loss_fn(output, batch_y)
+            end
+            batch_loss = loss.data[1]
+
+            # Backward + update
+            TensorEngine.backward(loss, ones(size(loss.data)))
+            step!(optimizer, params)
+            
+            epoch_loss += batch_loss
+            batch_count += 1
+            
+            progress_interval = max(1, n_batches ÷ 20)
+
+            if verbose && batch_idx % progress_interval == 0
+                progress = batch_idx / n_batches * 100
+                progress_blocks = round(Int, progress / 5)           # ✅ seguro
+                remaining_blocks = 20 - progress_blocks              # ✅ seguro
+
+                print("\rProgress: [" * "="^progress_blocks * " "^remaining_blocks * "] " *
+                    Printf.@sprintf("%.1f%% | Loss: %.4f", progress, batch_loss))
+            end
+
+            
+            # Limpiar memoria GPU si es necesario
+            if use_gpu && batch_idx % 10 == 0
+                GPUMemoryManager.check_and_clear_gpu_memory()
+            end
+        end
+        
+        # Calcular loss promedio de la época
+        avg_epoch_loss = epoch_loss / batch_count
+        push!(history[:loss], avg_epoch_loss)
+        
+        # Calcular métricas
+        if !isempty(metrics)
+            metric_values = _compute_epoch_metrics(
+                model, X_tensors, y_tensors, metrics, batch_size, use_gpu
+            )
+            
+            # Guardar métricas
+            for (metric_name, value) in metric_values
+                push!(history[:metrics][metric_name], value)
+            end
+            
+            # Mostrar resumen de época
+            if verbose
+                elapsed = time() - epoch_start
+                metric_str = join(["$k: $(round(v, digits=4))" for (k,v) in metric_values], ", ")
+                println(Printf.@sprintf("\nEpoch %d/%d - %.2fs - loss: %.4f - %s", 
+                        epoch, epochs, elapsed, avg_epoch_loss, metric_str))
+            end
+        else
+            if verbose
+                elapsed = time() - epoch_start
+                println(Printf.@sprintf("\nEpoch %d/%d - %.2fs - loss: %.4f", 
+                        epoch, epochs, elapsed, avg_epoch_loss))
+            end
+        end
+    end
+    
+    return history
+end
+
+# Funciones auxiliares
+
+function _validate_training_inputs(X, y)
+    if isempty(X) || isempty(y)
+        throw(ArgumentError("Los datos de entrada X e y no pueden estar vacíos"))
+    end
+    
+    n_x = isa(X, AbstractArray) ? (ndims(X) > 1 ? size(X)[end] : length(X)) : length(X)
+    n_y = isa(y, AbstractArray) ? (ndims(y) > 1 ? size(y)[end] : length(y)) : length(y)
+    
+    if n_x != n_y
+        throw(DimensionMismatch("X tiene $n_x muestras pero y tiene $n_y muestras"))
+    end
+end
+
+function _prepare_tensors(data)
+    if isa(data, Vector{<:Tensor})
+        return data
+    elseif isa(data, AbstractArray)
+        # Si es un array multidimensional, separar por última dimensión
+        if ndims(data) > 1
+            n_samples = size(data)[end]
+            slices = [selectdim(data, ndims(data), i) for i in 1:n_samples]
+            return [Tensor(Float32.(slice)) for slice in slices]
+        else
+            # Vector simple - IMPORTANTE: mantener como matriz columna
+            return [Tensor(reshape(Float32.([x]), :, 1)) for x in data]
+        end
+    else
+        throw(ArgumentError("Tipo de datos no soportado: $(typeof(data))"))
+    end
+end
+
+function _compute_epoch_metrics(model, X_tensors, y_tensors, metrics, batch_size, use_gpu)
+    metric_values = Pair{Symbol, Float64}[]
+    
+    n_samples = length(X_tensors)
+    
+    for metric in metrics
+        metric_name = Symbol(nameof(metric))
+        metric_sum = 0.0
+        
+        # Modo evaluación
+        Utils.set_training_mode!(model, false)
+        
+        # Calcular métrica en todos los datos
+        for i in 1:batch_size:n_samples
+            end_idx = min(i + batch_size - 1, n_samples)
+            batch_X = X_tensors[i:end_idx]
+            batch_y = y_tensors[i:end_idx]
+            
+            # Stack batch
+            batch_X_stacked = stack_batch(batch_X)
+            batch_y_stacked = stack_batch(batch_y)
+            
+            # Forward pass
+            predictions = NeuralNetwork.forward(model, batch_X_stacked)
+            
+            # Calcular métrica
+            pred_data = predictions.data isa CUDA.CuArray ? Array(predictions.data) : predictions.data
+            true_data = batch_y_stacked.data isa CUDA.CuArray ? Array(batch_y_stacked.data) : batch_y_stacked.data
+            batch_metric = metric(pred_data, true_data)
+            metric_sum += batch_metric * length(i:end_idx)
+        end
+        
+        # Volver a modo entrenamiento
+        Utils.set_training_mode!(model, true)
+        
+        avg_metric = metric_sum / n_samples
+        push!(metric_values, metric_name => avg_metric)
+    end
+    
+    return metric_values
+end
 # -----------------------------------------------------------------------
 # DataLoader y funciones relacionadas
 # -----------------------------------------------------------------------
@@ -508,9 +1078,7 @@ function train_with_loaders(model, optimizer, loss_fn, train_loader, val_loader,
             loss = loss_fn(output, batch_y)
             
             # Backpropagation
-            if loss.backward_fn !== nothing
-                loss.backward_fn(ones(size(loss.data)))
-            end
+            TensorEngine.backward(loss, ones(size(loss.data)))
             
             # Actualizar parámetros
             step!(optimizer, params)
@@ -1079,9 +1647,7 @@ function train_improved_gpu!(
             loss = loss_fn(output, batch_y)
             
             # Backpropagation
-            if loss.backward_fn !== nothing
-                loss.backward_fn(ones(size(loss.data)))
-            end
+            TensorEngine.backward(loss, ones(size(loss.data)))
             
             # Actualizar parámetros
             step!(optimizer, params)
@@ -1178,5 +1744,12 @@ function adapt_image(img::TensorEngine.Tensor)
     end
     return TensorEngine.Tensor(data_reshaped)
 end
+
+
+
+
+
+
+
 
 end # module Training

@@ -1,6 +1,6 @@
 using DeepDynamics
 using Test
-
+using DeepDynamics: Activation
 println("\n=== TEST INTEGRACIÓN FASE 3 (CORREGIDO) ===")
 
 @testset "Integración Fase 3" begin
@@ -10,6 +10,7 @@ println("\n=== TEST INTEGRACIÓN FASE 3 (CORREGIDO) ===")
         Activation(relu),
         Dense(20, 5)
     ])
+
     
     # Datos de entrada
     X = Tensor(randn(Float32, 10, 4))  # 10 features, 4 samples

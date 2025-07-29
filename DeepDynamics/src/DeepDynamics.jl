@@ -85,13 +85,15 @@ include("TensorEngine.jl")
 include("ConvKernelLayers.jl")
 include("Visualizations.jl")
 include("ReshapeModule.jl")
-include("Losses.jl")
+
 include("ConvolutionalLayers.jl")
 include("Layers.jl")
 include("EmbeddingLayer.jl")
 include("NeuralNetwork.jl")
+include("Losses.jl")
 include("Utils.jl")
 include("Optimizers.jl")
+include("Callbacks.jl")
 include("Metrics.jl")
 include("Reports.jl")
 include("DataLoaders.jl")
@@ -109,11 +111,11 @@ include("Models.jl")
 using .TensorEngine: Tensor, backward, mse_loss, initialize_grad!, initialize_weights,
                      l2_regularization, compute_loss_with_regularization, clip_gradients!,
                      to_gpu, to_cpu, zero_grad!, add, device_of, same_device, gpu_memory_info,
-                     ensure_gpu_memory!
+                     ensure_gpu_memory!, log, mean
 
 using .Visualizations
 using .ReshapeModule: Reshape
-using .Losses: binary_crossentropy, categorical_crossentropy
+using .Losses: binary_crossentropy, categorical_crossentropy,binary_crossentropy_with_logits
 using .Layers: BatchNorm, set_training!, reset_running_stats!, Flatten,
                swish, mish, GlobalAvgPool, DropoutLayer, LayerActivation
 using .ConvolutionalLayers: Conv2D, MaxPooling, Conv2DTranspose
@@ -125,9 +127,11 @@ using .NeuralNetwork: Sequential, Dense, Activation, collect_parameters,
 using .Optimizers: SGD, Adam, RMSProp, Adagrad, Nadam, step! as optim_step!
 using .Metrics: accuracy, mae, rmse, f1_score, precision, recall, binary_accuracy
 using .Reports
-using .Training: train_batch!, train!, train_improved!, EarlyStopping, Callback,
-                 PrintCallback, FinalReportCallback, add_callback!,
-                 run_epoch_callbacks, run_final_callbacks, stack_batch
+using .Training: train!, train_batch!, compute_accuracy_general, train_improved!,
+       EarlyStopping, FinalReportCallback, add_callback!,  # Estos ahora vienen de Callbacks
+       run_epoch_callbacks, run_final_callbacks, 
+       train_with_loaders, stack_batch, evaluate_model, 
+       fit!, History
 using .Utils: normalize_inputs, set_training_mode!
 using .TextUtils: build_vocabulary, text_to_indices, pad_sequence
 using .ImageProcessing: load_image, load_images_from_folder, augment_image, prepare_batch
@@ -138,10 +142,16 @@ using .LRSchedulers: StepScheduler, CosineAnnealingScheduler, get_lr
 using .Models: create_resnet, create_simple_cnn
 using .GPUMemoryManager: get_tensor_buffer, check_and_clear_gpu_memory, release_tensor_buffer, clear_cache
 using .DataLoaders: DataLoader, optimized_data_loader,  cleanup_data_loader!
-
+using .Callbacks: AbstractCallback, EarlyStopping, ReduceLROnPlateau, ModelCheckpoint,
+       PrintCallback, FinalReportCallback,
+       on_epoch_begin, on_epoch_end, on_train_begin, on_train_end,
+       on_batch_begin, on_batch_end
 # ----------------------------------------------------------
 # Exportación final
 # ----------------------------------------------------------
+const f0 = Float32(0)
+
+
 export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero_grad!, add, backward, mse_loss,
        Sequential, Dense, forward, collect_parameters,
        relu, sigmoid, tanh_activation, leaky_relu, swish, mish, softmax,
@@ -163,6 +173,11 @@ export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero
        StepScheduler, CosineAnnealingScheduler, get_lr,
        create_resnet, create_simple_cnn,
        set_training!, reset_running_stats!, set_training_mode!,DataLoader,  cleanup_data_loader!,
-       gpu_available, get_device, set_default_device!, auto_device, validate_gpu_environment, optimized_data_loader
+       gpu_available, get_device, set_default_device!, auto_device, validate_gpu_environment, optimized_data_loader,
+       Activation,binary_crossentropy_with_logits, fit!, History, evaluate_model, EarlyStopping, compute_accuracy_general,
+       AbstractCallback, EarlyStopping, ReduceLROnPlateau, ModelCheckpoint,
+       PrintCallback, FinalReportCallback,
+       on_epoch_begin, on_epoch_end, on_train_begin, on_train_end,
+       on_batch_begin, on_batch_end,f0
 
 end # module

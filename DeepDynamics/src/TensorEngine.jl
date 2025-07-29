@@ -281,7 +281,9 @@ function matmul(t1::Tensor{2}, t2::Tensor{2})::Tensor{2}
     return result
 end
 
-# Agregar estas funciones a TensorEngine.jl después de la función add
+
+
+
 
 # Multiplicación escalar
 function Base.:*(scalar::Number, t::Tensor)
@@ -385,6 +387,23 @@ end
 Base.copyto!(dest::Tensor, src::Tensor) = (copyto!(dest.data, src.data); dest)
 Base.copyto!(dest::Tensor, src) = (copyto!(dest.data, src); dest)
 
+
+Base.:+(t1::Tensor{N}, t2::Tensor{N}) where {N} = add(t1, t2)
+# Resta escalar - tensor
+function Base.:-(scalar::Number, t::Tensor)
+    result_data = scalar .- t.data
+    result = Tensor(result_data; requires_grad=t.requires_grad)
+
+    if t.requires_grad
+        result.backward_fn = grad -> begin
+            grad_data = grad isa Tensor ? grad.data : grad
+            backward(t, Tensor(-grad_data; requires_grad=false))
+        end
+    end
+
+    return result
+end
+
 # Reemplaza la función backward en TensorEngine.jl con esta versión
 function backward(t::Tensor, grad::Union{Tensor, AbstractArray})
     # Verificar si requiere gradientes
@@ -416,10 +435,14 @@ function backward(t::Tensor, grad::Union{Tensor, AbstractArray})
     end
     
     # Verificar dimensiones y expandir si es necesario
+        
     if size(grad_data) != size(t.data)
         # Si grad es escalar y t no, expandir grad
         if length(grad_data) == 1
             grad_data = fill(grad_data[1], size(t.data))
+        # NUEVO: Si tienen el mismo número de elementos, hacer reshape
+        elseif prod(size(grad_data)) == prod(size(t.data))
+            grad_data = reshape(grad_data, size(t.data))
         else
             error("Gradient shape $(size(grad_data)) doesn't match tensor shape $(size(t.data))")
         end
@@ -687,6 +710,35 @@ function release_tensor(tensor::Tensor)
         GPUMemoryManager.release_tensor_buffer(tensor.data)
     end
 end
+
+function log(t::Tensor)
+    data = log.(t.data)
+    out = Tensor(data; requires_grad=t.requires_grad)
+
+    if out.requires_grad
+        out.backward_fn = function(grad)
+            grad_input = grad ./ t.data
+            backward(t, Tensor(grad_input))
+        end
+    end
+
+    return out
+end
+
+function mean(x::Tensor)
+    n = length(x.data)
+    μ = sum(x.data) / n
+    out = Tensor([μ]; requires_grad = x.requires_grad)
+    if x.requires_grad
+        out.backward_fn = grad -> begin
+            gval = grad isa AbstractArray ? grad[1] : grad
+            grad_input = fill(gval / n, size(x.data))
+            backward(x, Tensor(grad_input))
+        end
+    end
+    return out
+end
+
 
 
 end  # module TensorEngine

@@ -7,6 +7,8 @@ using DeepDynamics.Layers
 using DeepDynamics.ConvolutionalLayers
 using DeepDynamics.EmbeddingLayer
 using CUDA
+using DeepDynamics: Activation, forward
+
 using Random
 
 Random.seed!(42)
@@ -103,7 +105,7 @@ println("GPU disponible: ", HAS_GPU)
         model = NeuralNetwork.model_to_cpu(Sequential([
             Conv2D(3, 32, (3,3), stride=(1,1), padding=(1,1)),
             BatchNorm(32),
-            LayerActivation(relu),
+            Activation(relu),
             MaxPooling((2,2)),
             create_residual_block(32, 64, 2),
             GlobalAvgPool(),
@@ -139,10 +141,11 @@ println("GPU disponible: ", HAS_GPU)
     @testset "5. Entrenamiento con dispositivos mixtos" begin
         model = NeuralNetwork.model_to_cpu(Sequential([
             Dense(10, 20),
-            LayerActivation(relu),
-            Dense(20, 2),
+            Activation(relu),
+            Dense(20, 2),             # ← asegúrate que esta capa esté presente
             Activation(softmax)
         ]))
+
         
         X = Tensor(randn(Float32, 10, 50))
         y = Tensor(zeros(Float32, 2, 50))

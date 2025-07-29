@@ -26,12 +26,28 @@ mutable struct Dense <: AbstractLayer.Layer
     biases::TensorEngine.Tensor
 end
 
-function Dense(input_size::Int, output_size::Int; init_method::Symbol=:xavier)
-    weights = TensorEngine.initialize_weights((input_size, output_size); method=init_method)
-    bias_data = CUDA.functional() ? CUDA.zeros(Float32, output_size, 1) : zeros(Float32, output_size, 1)
-    biases = TensorEngine.Tensor(0.01f0 .* bias_data)
-    Dense(weights, biases)
+function Dense(in_dim::Integer, out_dim::Integer;
+               init_method::Symbol = :xavier,
+               requires_grad::Bool = true)
+    # Elige estrategia de init
+    W_data = if init_method == :he
+        σ = sqrt(2f0 / in_dim)
+        randn(Float32, out_dim, in_dim) .* σ
+    elseif init_method == :xavier
+        σ = sqrt(1f0 / in_dim)
+        randn(Float32, out_dim, in_dim) .* σ
+    else
+        error("Unknown init_method: $init_method")
+    end
+    b_data = zeros(Float32, out_dim, 1)
+
+    # Envuelve en Tensor
+    W = Tensor(W_data; requires_grad=requires_grad)
+    b = Tensor(b_data; requires_grad=requires_grad)
+
+    return Dense(W, b)  # llama al inner constructor
 end
+
 
 function forward(layer::Dense, input::TensorEngine.Tensor)
     # Asegurar que datos están en el mismo dispositivo
@@ -143,103 +159,116 @@ end
 
 # ---------- ReLU ----------
 function relu(t::TensorEngine.Tensor)
-    out = _new_activation_tensor(max.(t.data, 0f0), t)
+    # NO USAR t.data!
+    output = max.(t, 0f0)  # Esto debería mantener el grafo
+    # O si necesitas trabajar con arrays:
+    out_data = max.(t.data, 0f0)
+    out = TensorEngine.Tensor(out_data; requires_grad=t.requires_grad)
     if out.requires_grad
-        out.backward_fn = grad -> TensorEngine.backward(
-            t,
-            TensorEngine.Tensor((t.data .> 0f0) .* grad)
-        )
+        out.backward_fn = function(grad)
+            grad_input = (t.data .> 0f0) .* grad
+            TensorEngine.backward(t, TensorEngine.Tensor(grad_input))
+        end
     end
     return out
 end
 
-# ---------- Sigmoid ----------
+# ---------- Sigmoid ----------  
 function sigmoid(t::TensorEngine.Tensor)
-    σ = 1f0 ./ (1f0 .+ exp.(-t.data))
-    out = _new_activation_tensor(σ, t)
+    neg_x = -t.data
+    exp_neg_x = exp.(neg_x)
+    σ_data = 1f0 ./ (1f0 .+ exp_neg_x)
+    
+    out = TensorEngine.Tensor(σ_data; requires_grad=t.requires_grad)
+    
     if out.requires_grad
-        out.backward_fn = grad -> TensorEngine.backward(
-            t,
-            TensorEngine.Tensor(σ .* (1f0 .- σ) .* grad)
-        )
+        # Capturar σ como tensor para que tenga .data
+        σ = out
+        out.backward_fn = function(grad)
+            grad_data = σ.data .* (1f0 .- σ.data) .* grad
+            TensorEngine.backward(t, TensorEngine.Tensor(grad_data))
+        end
     end
+    
     return out
 end
+
 
 # ---------- Tanh ----------
 function tanh_activation(t::TensorEngine.Tensor)
     τ = tanh.(t.data)
-    out = _new_activation_tensor(τ, t)
+    out = TensorEngine.Tensor(τ; requires_grad=t.requires_grad)
     if out.requires_grad
-        out.backward_fn = grad -> TensorEngine.backward(
-            t,
-            TensorEngine.Tensor((1f0 .- τ.^2) .* grad)
-        )
+        out.backward_fn = function(grad)
+            grad_input = (1f0 .- τ.^2) .* grad
+            TensorEngine.backward(t, TensorEngine.Tensor(grad_input))
+        end
     end
     return out
 end
 
-# ---------- Leaky‑ReLU ----------
+# ---------- Leaky ReLU ----------
 function leaky_relu(t::TensorEngine.Tensor; α = 0.01f0)
-    y  = max.(t.data, α .* t.data)
-    out = _new_activation_tensor(y, t)
+    y = max.(t.data, α .* t.data)
+    out = TensorEngine.Tensor(y; requires_grad=t.requires_grad)
     if out.requires_grad
-        deriv = map(x -> x > 0f0 ? 1f0 : α, t.data)
-        out.backward_fn = grad -> TensorEngine.backward(
-            t,
-            TensorEngine.Tensor(deriv .* grad)
-        )
+        out.backward_fn = function(grad)
+            deriv = map(x -> x > 0f0 ? 1f0 : α, t.data)
+            grad_input = deriv .* grad
+            TensorEngine.backward(t, TensorEngine.Tensor(grad_input))
+        end
     end
     return out
 end
 
 # ---------- Swish ----------
 function swish(t::TensorEngine.Tensor)
-    σ = 1f0 ./ (1f0 .+ exp.(-t.data))
+    neg_x = -t.data
+    exp_neg_x = exp.(neg_x)
+    σ = 1f0 ./ (1f0 .+ exp_neg_x)
     y = t.data .* σ
-    out = _new_activation_tensor(y, t)
+    
+    out = TensorEngine.Tensor(y; requires_grad=t.requires_grad)
     if out.requires_grad
-        grad_factor = σ .+ t.data .* σ .* (1f0 .- σ)
-        out.backward_fn = grad -> TensorEngine.backward(
-            t,
-            TensorEngine.Tensor(grad .* grad_factor)
-        )
+        out.backward_fn = function(grad)
+            grad_factor = σ .+ t.data .* σ .* (1f0 .- σ)
+            grad_input = grad .* grad_factor
+            TensorEngine.backward(t, TensorEngine.Tensor(grad_input))
+        end
     end
     return out
 end
 
 # ---------- Mish ----------
 function mish(t::TensorEngine.Tensor)
-    sp = log.(1f0 .+ exp.(t.data))        # softplus
-    τ  = tanh.(sp)
-    y  = t.data .* τ
-    out = _new_activation_tensor(y, t)d
+    exp_x = exp.(t.data)
+    sp = log.(1f0 .+ exp_x)  # softplus
+    τ = tanh.(sp)
+    y = t.data .* τ
+    
+    out = TensorEngine.Tensor(y; requires_grad=t.requires_grad)
     if out.requires_grad
-        δ = τ .+ t.data .* (1f0 .- τ.^2) .* (exp.(t.data) ./ (1f0 .+ exp.(t.data)))
-        out.backward_fn = grad -> TensorEngine.backward(
-            t,
-            TensorEngine.Tensor(grad .* δ)
-        )
+        out.backward_fn = function(grad)
+            σ = exp_x ./ (1f0 .+ exp_x)
+            δ = τ .+ t.data .* (1f0 .- τ.^2) .* σ
+            grad_input = grad .* δ
+            TensorEngine.backward(t, TensorEngine.Tensor(grad_input))
+        end
     end
     return out
 end
 
-# ---------- Softmax ----------
+# ---------- Softmax ---------- (esta ya está bien)
 function softmax(t::TensorEngine.Tensor)::TensorEngine.Tensor
-    # Para formato (features, batch), softmax sobre dimensión 1
-    max_vals = maximum(t.data, dims=1)  # Máximo por columna
+    max_vals = maximum(t.data, dims=1)
     exp_vals = exp.(t.data .- max_vals)
     sum_exp = sum(exp_vals, dims=1)
     probs = exp_vals ./ sum_exp
     
-    # Conservar requires_grad
-    out = TensorEngine.Tensor(probs; requires_grad = t.requires_grad)
+    out = TensorEngine.Tensor(probs; requires_grad=t.requires_grad)
     
-    if t.requires_grad
-        out.backward_fn = grad -> begin
-            # Jacobiano de softmax: diag(p) - p*p'
-            # Para batch: grad * (probs .* (1 - probs)) para elementos diagonales
-            # menos suma de (grad .* probs) * probs para productos cruzados
+    if out.requires_grad
+        out.backward_fn = function(grad)
             grad_sum = sum(grad .* probs, dims=1)
             grad_input = probs .* (grad .- grad_sum)
             TensorEngine.backward(t, TensorEngine.Tensor(grad_input))

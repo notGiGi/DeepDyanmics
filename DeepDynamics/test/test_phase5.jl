@@ -69,16 +69,17 @@ println("=== TESTS FASE 5: Formato Consistente + Conv2D Fix ===")
         model = Sequential([
             Conv2D(3, 32, (3,3), padding=(1,1)),
             BatchNorm(32),
-            Activation(relu),
+            Activation(relu),                      # ✅
             MaxPooling((2,2)),
             ConvKernelLayer(32, 64, (3,3), padding=(1,1)),
             BatchNorm(64),
-            Activation(relu),
+            Activation(relu),                      # ✅
             MaxPooling((2,2)),
             Flatten(),
             Dense(64*8*8, 10),
-            Activation(softmax)
+            Activation(softmax)                    # ✅
         ])
+
         
         # Forward con batch
         X = Tensor(randn(Float32, 4, 3, 32, 32))

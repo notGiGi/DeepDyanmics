@@ -147,6 +147,12 @@ function Adam(;
     )
 end
 
+# Constructor alternativo para compatibilidad con argumentos posicionales
+function Adam(learning_rate::Real)
+    return Adam(; learning_rate=learning_rate)
+end
+
+
 function RMSProp(; 
     learning_rate::Real = 0.001, 
     decay_rate::Real = 0.9, 

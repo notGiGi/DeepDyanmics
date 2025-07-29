@@ -1,7 +1,7 @@
 using DeepDynamics
 using Random
 Random.seed!(123)
-
+using DeepDynamics: Activation
 println("=== TEST INTEGRACIÓN FASE 1 + FASE 2 ===")
 
 # Datos: problema de regresión simple
@@ -16,10 +16,11 @@ y = Tensor(y_data; requires_grad=false)
 model = Sequential([
     Dense(5, 10),
     Activation(relu),
-        Dense(10, 5),
+    Dense(10, 5),
     Activation(relu),
-        Dense(5, 1)
+    Dense(5, 1)
 ])
+
 
 # Adam mejorado
 opt = Adam(learning_rate=0.01, weight_decay=0.001)

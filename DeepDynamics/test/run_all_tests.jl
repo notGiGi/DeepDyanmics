@@ -33,8 +33,23 @@ let
         #FASE 5
         ("test/test_phase5.jl", "Test Fase 5 - CNN"),
 
-        #FASE &
-        ("test/test_phase6.jl", "Test Fase 6 - GPU")
+        #FASE 6
+        ("test/test_phase6.jl", "Test Fase 6 - GPU"),
+
+        #Fase 7
+        ("test/test_phase7.jl", "Test Fase 7"),
+
+        #Fase 8
+        ("test/test_phase8.jl", "Test Fase 8"),
+
+        #Fase 9
+        ("test/test_phase9.jl","Test Fase 9"),
+
+        #Fase 10
+        ("test/test_phase10.jl", "Test Fase 10"),
+
+        #Fase B
+        ("test/test_train.jl", "Test Fase B - Train!")
     ]
 
     for (file, name) in tests

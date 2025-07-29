@@ -222,6 +222,7 @@ println("\n=== TEST INTEGRACIÓN FASE 4 ===")
         Activation(relu),
         Dense(64, 10)
     ])
+
     
     # Datos sintéticos
     X = Tensor(randn(Float32, 784, 16))  # 16 muestras
@@ -285,6 +286,7 @@ println("\n=== TEST CONVERGENCIA CON BATCHNORM ===")
         Dense(8, 2),
         Activation(softmax)
     ])
+
     
     opt = Adam(learning_rate=0.01)
     params = collect_parameters(model)
