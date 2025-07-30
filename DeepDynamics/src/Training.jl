@@ -11,7 +11,8 @@ using ..Callbacks: AbstractCallback, EarlyStopping, FinalReportCallback,
                    on_epoch_end, on_train_end
                    # Al inicio del módulo Training, después de using ..Callbacks
 using ..Callbacks: on_epoch_begin, on_epoch_end, on_train_begin, on_train_end, 
-                   on_batch_begin, on_batch_end, PrintCallback
+                   on_batch_begin, on_batch_end, PrintCallback, ProgressCallback,
+                   ReduceLROnPlateau
 using ..Losses
 using Random
 using LinearAlgebra
@@ -26,7 +27,7 @@ export train!, train_batch!, compute_accuracy_general, train_improved!,
        fit!, History
 using ..Metrics: accuracy, mae, rmse, binary_accuracy
 const optim_step! = Optimizers.step!
-   
+const AnyDataLoader = Union{DataLoader, DataLoaders.OptimizedDataLoader}   
 
 
   
@@ -149,10 +150,286 @@ mutable struct History
 end
 
 """
-    fit!(model, X_train, y_train; kwargs...)
+    fit!(model, train_loader::DataLoader; kwargs...)
 
-Entrena el modelo con una interfaz moderna y completa.
+Entrena el modelo usando DataLoader con soporte completo para callbacks y métricas.
+Soporta tanto DataLoader estándar como OptimizedDataLoader.
 """
+function fit!(model::Sequential, train_loader::AnyDataLoader;
+              val_loader::Union{AnyDataLoader, Nothing}=nothing,
+              optimizer=Adam(0.001f0),
+              loss_fn=mse_loss,
+              epochs::Int=10,
+              callbacks::Vector{<:AbstractCallback}=AbstractCallback[],
+              verbose::Int=1)
+    
+    # Convertir callbacks a tipo correcto
+    callbacks = Vector{AbstractCallback}(callbacks)
+    
+    # Agregar PrintCallback si verbose > 0
+    if verbose > 0 && !any(cb isa PrintCallback for cb in callbacks)
+        pushfirst!(callbacks, PrintCallback(1))
+    end
+    
+    # Agregar ProgressCallback si verbose > 1
+    if verbose > 1
+        push!(callbacks, ProgressCallback(verbose))
+    end
+    
+    # Inicializar historia
+    history = History()
+    params = collect_parameters(model)
+    
+    # Detectar dispositivo del modelo
+    model_dev = model_device(model)
+    
+    # Logs globales para callbacks
+    logs = Dict{Symbol, Any}(
+        :model => model,
+        :optimizer => optimizer,
+        :params => params,
+        :train_losses => Float64[],
+        :val_losses => Float64[]
+    )
+    
+    # on_train_begin
+    for cb in callbacks
+        on_train_begin(cb, logs)
+    end
+    
+    # Configurar callbacks que necesitan referencias
+    for cb in callbacks
+        if cb isa ReduceLROnPlateau && hasproperty(cb, :optimizer_ref)
+            cb.optimizer_ref = optimizer
+        elseif cb isa ProgressCallback && hasproperty(cb, :total_batches)
+            cb.total_batches = length(train_loader)
+        end
+    end
+    
+    # Loop principal de entrenamiento
+    for epoch in 1:epochs
+        epoch_start_time = time()
+        
+        # Logs de época
+        epoch_logs = Dict{Symbol, Any}(:epoch => epoch)
+        
+        # on_epoch_begin
+        for cb in callbacks
+            on_epoch_begin(cb, epoch, epoch_logs)
+        end
+        
+        # Establecer modo training
+        set_training_mode!(model, true)
+        
+        # Métricas de época
+        epoch_loss_sum = 0.0
+        epoch_correct = 0
+        epoch_total = 0
+        batch_count = 0
+        
+        # Mostrar progreso si verbose > 0
+        if verbose > 0
+            println("\nÉpoca $epoch/$epochs")
+            verbose > 1 && print("Entrenamiento: ")
+        end
+        
+        # Iterar sobre batches del DataLoader
+        for (batch_idx, (batch_x, batch_y)) in enumerate(train_loader)
+            batch_logs = Dict{Symbol, Any}(:batch => batch_idx)
+            
+            # on_batch_begin
+            for cb in callbacks
+                on_batch_begin(cb, batch_idx, batch_logs)
+            end
+            
+            # PROCESAMIENTO INTELIGENTE DE BATCHES
+            # Necesitamos manejar 3 casos posibles:
+            # 1. Vector de Tensores (DataLoader normal)
+            # 2. Tensor 2D correcto (OptimizedDataLoader bien formateado)
+            # 3. Tensor 1D aplanado (OptimizedDataLoader mal formateado)
+            
+            # Procesar input batch
+            input_batch = process_batch_input(batch_x, model)
+            
+            # Procesar target batch - necesita saber las dimensiones esperadas
+            target_batch = process_batch_target(batch_y, input_batch, loss_fn)
+            
+            # Actualizar tamaño del batch en logs
+            batch_logs[:size] = size(input_batch.data, 2)
+            
+            # Sincronización GPU/CPU
+            if model_dev == :gpu
+                if !(input_batch.data isa CUDA.CuArray)
+                    input_batch = to_gpu(input_batch)
+                end
+                if !(target_batch.data isa CUDA.CuArray)
+                    target_batch = to_gpu(target_batch)
+                end
+            else
+                if input_batch.data isa CUDA.CuArray
+                    input_batch = to_cpu(input_batch)
+                end
+                if target_batch.data isa CUDA.CuArray
+                    target_batch = to_cpu(target_batch)
+                end
+            end
+            
+            # Zero gradients
+            for param in params
+                zero_grad!(param)
+            end
+            
+            # Forward pass
+            output = forward(model, input_batch)
+            
+            # Calcular loss
+            loss = loss_fn(output, target_batch)
+            batch_loss = if loss.data isa CUDA.CuArray
+                Array(loss.data)[1]
+            else
+                loss.data[1]
+            end
+            
+            # Backward pass
+            if loss.backward_fn !== nothing
+                loss.backward_fn(ones(size(loss.data)))
+            end
+            
+            # Actualizar parámetros
+            optim_step!(optimizer, params)
+            
+            # Acumular métricas
+            epoch_loss_sum += batch_loss
+            batch_count += 1
+            
+            # Calcular accuracy si es clasificación
+            if ndims(output.data) == 2 && size(output.data, 1) > 1
+                # Multi-clase
+                preds = argmax(output.data, dims=1)
+                labels = argmax(target_batch.data, dims=1)
+                epoch_correct += sum(preds .== labels)
+                epoch_total += size(labels, 2)
+            elseif ndims(output.data) == 2 && size(output.data, 1) == 1
+                # Binaria
+                preds = output.data .> 0.5
+                labels = target_batch.data .> 0.5
+                epoch_correct += sum(preds .== labels)
+                epoch_total += length(labels)
+            end
+            
+            batch_logs[:loss] = batch_loss
+            
+            # on_batch_end
+            for cb in callbacks
+                on_batch_end(cb, batch_idx, batch_logs)
+            end
+            
+            # Limpieza periódica de memoria GPU
+            if CUDA.functional() && batch_idx % 10 == 0
+                CUDA.reclaim()
+            end
+        end
+        
+        # Calcular métricas finales de época
+        train_loss = epoch_loss_sum / batch_count
+        train_acc = epoch_total > 0 ? epoch_correct / epoch_total : 0.0
+        
+        # Guardar en historia
+        push!(history.train_loss, Float32(train_loss))
+        if !haskey(history.train_metrics, "accuracy")
+            history.train_metrics["accuracy"] = Float32[]
+        end
+        push!(history.train_metrics["accuracy"], Float32(train_acc))
+        
+        # Evaluación en validación
+        val_loss = NaN
+        val_acc = 0.0
+        if val_loader !== nothing
+            set_training_mode!(model, false)
+            val_loss, val_acc = evaluate_loader(model, loss_fn, val_loader, model_dev)
+            push!(history.val_loss, Float32(val_loss))
+            if !haskey(history.val_metrics, "accuracy")
+                history.val_metrics["accuracy"] = Float32[]
+            end
+            push!(history.val_metrics["accuracy"], Float32(val_acc))
+        else
+            push!(history.val_loss, NaN32)
+            if !haskey(history.val_metrics, "accuracy")
+                history.val_metrics["accuracy"] = Float32[]
+            end
+            push!(history.val_metrics["accuracy"], NaN32)
+        end
+        
+        # Imprimir resumen de época
+        if verbose > 0
+            if verbose > 1
+                println()  # Nueva línea después del progress bar
+            end
+            elapsed = round(time() - epoch_start_time, digits=1)
+            print("  $(elapsed)s - loss: $(round(train_loss, digits=4))")
+            print(" - accuracy: $(round(train_acc*100, digits=2))%")
+            if val_loader !== nothing && !isnan(val_loss)
+                print(" - val_loss: $(round(val_loss, digits=4))")
+                print(" - val_accuracy: $(round(val_acc*100, digits=2))%")
+            end
+            println()
+        end
+        
+        # Preparar logs para callbacks de época
+        epoch_logs[:loss] = train_loss
+        epoch_logs[:train_accuracy] = train_acc
+        epoch_logs[:val_loss] = val_loss
+        epoch_logs[:val_accuracy] = val_acc
+        epoch_logs[:time] = time() - epoch_start_time
+        
+        # on_epoch_end para todos los callbacks
+        should_stop = false
+        for cb in callbacks
+            on_epoch_end(cb, epoch, epoch_logs)
+            
+            # Verificar early stopping
+            if cb isa EarlyStopping && hasproperty(cb, :stopped) && cb.stopped
+                should_stop = true
+            end
+        end
+        
+        if should_stop
+            verbose > 0 && println("\nEarly stopping en época $epoch")
+            break
+        end
+        
+        # Actualizar épocas en historia
+        history.epochs = epoch
+        
+        # Memory cleanup al final de cada época
+        if CUDA.functional()
+            GPUMemoryManager.clear_cache()
+            GC.gc()
+            CUDA.reclaim()
+        end
+    end
+    
+    # on_train_end para todos los callbacks
+    logs[:history] = history
+    for cb in callbacks
+        on_train_end(cb, logs)
+    end
+    
+    # Establecer modo evaluación
+    set_training_mode!(model, false)
+    
+    # Limpiar DataLoaders optimizados si aplica
+    if isdefined(train_loader, :is_active) && train_loader.is_active
+        cleanup_data_loader!(train_loader)
+    end
+    if val_loader !== nothing && isdefined(val_loader, :is_active) && val_loader.is_active
+        cleanup_data_loader!(val_loader)
+    end
+    
+    return history
+end
+
+
 function fit!(model::Sequential, X_train::Vector{<:Tensor}, y_train::Vector{<:Tensor};
               X_val=nothing, y_val=nothing,
               optimizer=Adam(0.001f0),
@@ -399,6 +676,147 @@ end
 
 
 
+
+# Función auxiliar para procesar input batches
+function process_batch_input(batch_x, model)
+    if isa(batch_x, Vector{<:TensorEngine.Tensor})
+        # DataLoader normal: stack de vectores
+        return stack_batch(batch_x)
+    elseif isa(batch_x, TensorEngine.Tensor)
+        # OptimizedDataLoader: ya es un tensor
+        data = batch_x.data
+        
+        # Verificar si las dimensiones son correctas
+        if ndims(data) == 1
+            # Está aplanado, necesitamos reconstruir
+            # Obtener el tamaño de entrada esperado de la primera capa
+            first_layer = model.layers[1]
+            if isa(first_layer, Dense)
+                input_dim = size(first_layer.weights.data, 2)
+                batch_size = div(length(data), input_dim)
+                
+                if length(data) != input_dim * batch_size
+                    error("Datos mal formateados: $(length(data)) elementos no divisibles por input_dim=$input_dim")
+                end
+                
+                # Reshape a (input_dim, batch_size)
+                reshaped = reshape(data, input_dim, batch_size)
+                return TensorEngine.Tensor(reshaped)
+            else
+                error("Primera capa no es Dense, no se puede inferir dimensiones")
+            end
+        elseif ndims(data) == 2
+            # Ya tiene forma correcta
+            return batch_x
+        else
+            error("Dimensiones inesperadas en batch_x: $(ndims(data))D")
+        end
+    else
+        error("Tipo de batch no soportado: $(typeof(batch_x))")
+    end
+end
+
+# Función auxiliar para procesar target batches
+function process_batch_target(batch_y, input_batch, loss_fn)
+    batch_size = size(input_batch.data, 2)
+    
+    if isa(batch_y, Vector{<:TensorEngine.Tensor})
+        # DataLoader normal: stack de vectores
+        return stack_batch(batch_y)
+    elseif isa(batch_y, TensorEngine.Tensor)
+        # OptimizedDataLoader: ya es un tensor
+        data = batch_y.data
+        
+        if ndims(data) == 1
+            # Está aplanado, necesitamos reconstruir
+            # Para clasificación, asumimos one-hot encoding
+            total_elements = length(data)
+            
+            if total_elements % batch_size != 0
+                error("Target mal formateado: $total_elements elementos no divisibles por batch_size=$batch_size")
+            end
+            
+            n_classes = div(total_elements, batch_size)
+            
+            # Reshape a (n_classes, batch_size)
+            reshaped = reshape(data, n_classes, batch_size)
+            return TensorEngine.Tensor(reshaped)
+        elseif ndims(data) == 2
+            # Ya tiene forma correcta
+            return batch_y
+        else
+            error("Dimensiones inesperadas en batch_y: $(ndims(data))D")
+        end
+    else
+        error("Tipo de batch no soportado: $(typeof(batch_y))")
+    end
+end
+
+# evaluate_loader completo con la misma lógica
+function evaluate_loader(model, loss_fn, data_loader::AnyDataLoader, device::Symbol)
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    num_batches = 0
+    
+    for (batch_x, batch_y) in data_loader
+        # Usar las mismas funciones de procesamiento
+        input_batch = process_batch_input(batch_x, model)
+        target_batch = process_batch_target(batch_y, input_batch, loss_fn)
+        
+        # Mover al dispositivo correcto
+        if device == :gpu
+            if !(input_batch.data isa CUDA.CuArray)
+                input_batch = to_gpu(input_batch)
+            end
+            if !(target_batch.data isa CUDA.CuArray)
+                target_batch = to_gpu(target_batch)
+            end
+        else
+            if input_batch.data isa CUDA.CuArray
+                input_batch = to_cpu(input_batch)
+            end
+            if target_batch.data isa CUDA.CuArray
+                target_batch = to_cpu(target_batch)
+            end
+        end
+        
+        # Forward pass sin gradientes
+        output = forward(model, input_batch)
+        loss = loss_fn(output, target_batch)
+        
+        # Acumular loss
+        loss_val = if loss.data isa CUDA.CuArray
+            Array(loss.data)[1]
+        else
+            loss.data[1]
+        end
+        total_loss += loss_val
+        num_batches += 1
+        
+        # Calcular accuracy basado en las dimensiones de salida
+        if ndims(output.data) == 2
+            if size(output.data, 1) > 1
+                # Multi-clase
+                preds = argmax(output.data, dims=1)
+                labels = argmax(target_batch.data, dims=1)
+                correct += sum(preds .== labels)
+                total += size(labels, 2)
+            else
+                # Binaria (1 neurona de salida)
+                preds = output.data .> 0.5
+                labels = target_batch.data .> 0.5
+                correct += sum(preds .== labels)
+                total += length(labels)
+            end
+        end
+    end
+    
+    avg_loss = num_batches > 0 ? total_loss / num_batches : NaN
+    accuracy = total > 0 ? correct / total : 0.0
+    
+    return avg_loss, accuracy
+end
 
 
 

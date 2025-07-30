@@ -10,7 +10,7 @@ using Printf
 export AbstractCallback, EarlyStopping, ReduceLROnPlateau, ModelCheckpoint,
        PrintCallback, FinalReportCallback,
        on_epoch_begin, on_epoch_end, on_train_begin, on_train_end,
-       on_batch_begin, on_batch_end
+       on_batch_begin, on_batch_end, ProgressCallback
 
 # ==================================================================
 # Interfaz base para callbacks
@@ -280,7 +280,7 @@ mutable struct ModelCheckpoint <: AbstractCallback
     save_best_only::Bool
     save_weights_only::Bool
     verbose::Bool
-    
+     
     # Estado interno
     best::Float32
     
@@ -406,5 +406,31 @@ function save_model_state(model::NeuralNetwork.Sequential, filepath::String)
     # Guardar
     JLD2.save(filepath, "model", model_dict)
 end
+
+
+mutable struct ProgressCallback <: AbstractCallback
+    verbose::Int
+    total_batches::Int
+    epoch_start_time::Float64
+    
+    ProgressCallback(verbose::Int=1) = new(verbose, 0, 0.0)
+end
+
+function on_epoch_begin(cb::ProgressCallback, epoch::Int, logs::Dict)
+    cb.epoch_start_time = time()
+end
+
+function on_batch_end(cb::ProgressCallback, batch::Int, logs::Dict)
+    if cb.verbose > 1 && batch % max(1, cb.total_batches ÷ 20) == 0
+        progress = batch / cb.total_batches
+        bar_length = 30
+        filled = Int(round(progress * bar_length))
+        bar = "█" ^ filled * "░" ^ (bar_length - filled)
+        loss = get(logs, :loss, 0.0)
+        print("\r  [$bar] $(round(Int, progress*100))% - loss: $(round(loss, digits=4))")
+        batch == cb.total_batches && println()
+    end
+end
+
 
 end # module Callbacks

@@ -146,7 +146,7 @@ using .DataLoaders: DataLoader, optimized_data_loader,  cleanup_data_loader!
 using .Callbacks: AbstractCallback, EarlyStopping, ReduceLROnPlateau, ModelCheckpoint,
        PrintCallback, FinalReportCallback,
        on_epoch_begin, on_epoch_end, on_train_begin, on_train_end,
-       on_batch_begin, on_batch_end
+       on_batch_begin, on_batch_end, ProgressCallback
 using .ModelSaver: save_model, load_model, save_checkpoint, load_checkpoint
 # ----------------------------------------------------------
 # Exportación final
@@ -180,6 +180,8 @@ export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero
        AbstractCallback, EarlyStopping, ReduceLROnPlateau, ModelCheckpoint,
        PrintCallback, FinalReportCallback,
        on_epoch_begin, on_epoch_end, on_train_begin, on_train_end,
-       on_batch_begin, on_batch_end,f0, save_model, load_model, save_checkpoint, load_checkpoint
+       on_batch_begin, on_batch_end,f0, save_model, load_model, save_checkpoint, load_checkpoint,
+       ProgressCallback
+       
 
 end # module

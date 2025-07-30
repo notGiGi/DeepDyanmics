@@ -41,7 +41,16 @@ end
 # ---------------------------------------------------------------------------
 Base.size(t::Tensor) = size(t.data)
 Base.ndims(t::Tensor) = ndims(t.data)
-
+Base.length(t::Tensor) = length(t.data)
+Base.getindex(t::Tensor, inds...) = begin
+    d = t.data
+    if d isa CUDA.CuArray
+        # Para evitar scalar-indexing en GPU, convertimos al CPU
+        return getindex(Array(d), inds...)
+    else
+        return getindex(d, inds...)
+    end
+end
 # ---------------------------------------------------------------------------
 # Función zero_grad!
 # ---------------------------------------------------------------------------
@@ -658,14 +667,23 @@ end
 Crea una copia del tensor en CPU sin modificar el original.
 """
 function to_cpu(t::Tensor)
+    # 1) Datos en CPU
     new_data = t.data isa CUDA.CuArray ? Array(t.data) : t.data
-    new_grad = t.grad !== nothing && t.grad.data isa CUDA.CuArray ?
-               Tensor(Array(t.grad.data); requires_grad=false) : t.grad
-    return Tensor(new_data;
-                  requires_grad = t.requires_grad,
-                  grad = new_grad,
-                  backward_fn = t.backward_fn)
+
+    # 2) Gradiente en CPU (si existía y venía de GPU, lo copiamos; si no, lo dejamos igual)
+    new_grad = if t.grad !== nothing && t.grad.data isa CUDA.CuArray
+        # NOTA: constructor posicional: (data, grad, backward_fn, requires_grad)
+        Tensor(Array(t.grad.data), nothing, nothing, false)
+    else
+        t.grad
+    end
+
+    # 3) Devolvemos el tensor con el constructor posicional:
+    #    Tensor(data::AbstractArray, grad::Union{Nothing,Tensor},
+    #           backward_fn::Union{Function,Nothing}, requires_grad::Bool)
+    return Tensor(new_data, new_grad, t.backward_fn, t.requires_grad)
 end
+
 
 # ---------------------------------------------------------------------------
 # Manejo de Memoria para GPU

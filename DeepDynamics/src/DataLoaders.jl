@@ -56,9 +56,10 @@ Base.length(dl::DataLoader) = Int(ceil(length(dl.data) / dl.batch_size))
 
 # Estructura para manejar data loaders optimizados con limpieza
 mutable struct OptimizedDataLoader
-    channel::Channel{Tuple}
+    channel::Channel    # acepta cualquier Channel{T}
     task::Task
     is_active::Bool
+    batch_size::Int
 end
 
 """
@@ -139,8 +140,15 @@ function optimized_data_loader(images, labels, batch_size; shuffle=true, to_gpu=
         end
     end
     
-    # Retornar estructura que permite limpieza
-    return OptimizedDataLoader(prefetch_queue, producer_task, true)
+
+    loader = OptimizedDataLoader(
+        prefetch_queue,
+        producer_task,
+        true,
+        batch_size,
+    )
+    register_loader!(loader)
+    return loader
 end
 
 """
