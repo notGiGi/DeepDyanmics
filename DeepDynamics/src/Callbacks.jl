@@ -104,7 +104,7 @@ mutable struct EarlyStopping <: AbstractCallback
     function EarlyStopping(;
         monitor::String="val_loss",
         patience::Int=5,
-        min_delta::Float32=0.0f0,
+        min_delta::Real=0.001,
         mode::Symbol=:min,
         restore_best_weights::Bool=true,
         verbose::Bool=true
