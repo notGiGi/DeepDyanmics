@@ -66,7 +66,7 @@ function clear_cache()
         for key in keys(CACHE_STATS)
             CACHE_STATS[key] = 0
         end
-        @info "GPU memory cache cleared"
+        #@info "GPU memory cache cleared"
     catch e
         @warn "Failed to clear GPU cache: $e"
     end

@@ -201,23 +201,20 @@ using Statistics  # Agregar import de Statistics
         @test length(history2[:loss]) == 1
     end
     
-    @testset "GPU Compatibility" begin
-        if gpu_available()
-            model = create_test_model() |> model_to_gpu
-            X, y = generate_test_data(20)
-            
-            history = train!(
-                model, X, y,
-                epochs=3,
-                batch_size=5,
-                verbose=false
-            )
-            
-            @test length(history[:loss]) == 3
-            @test model_device(model) == :gpu
-        else
-            @test_skip "GPU no disponible"
-        end
+    @testset "GPU Compatibility (asumida siempre)" begin
+        # Asumimos que la GPU está disponible
+        model = model_to_gpu(create_test_model())
+        X, y = generate_test_data(20)
+
+        history = train!(
+            model, X, y,
+            epochs=3,
+            batch_size=5,
+            verbose=false
+        )
+
+        @test length(history[:loss]) == 3
+        @test model_device(model) == :gpu
     end
     
     @testset "Format Adaptation" begin

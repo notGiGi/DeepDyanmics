@@ -83,9 +83,7 @@ include("DataAugmentation.jl")
 include("AbstractLayer.jl")
 include("TensorEngine.jl")
 include("ConvKernelLayers.jl")
-
 include("ReshapeModule.jl")
-
 include("ConvolutionalLayers.jl")
 include("Layers.jl")
 include("EmbeddingLayer.jl")
@@ -94,8 +92,8 @@ include("Losses.jl")
 include("Utils.jl")
 include("Optimizers.jl")
 include("ModelSaver.jl")
-
 include("Callbacks.jl")
+include("Logging.jl")
 include("Metrics.jl")
 include("Reports.jl")
 include("DataLoaders.jl")
@@ -150,6 +148,11 @@ using .Callbacks: AbstractCallback, EarlyStopping, ReduceLROnPlateau, ModelCheck
        on_epoch_begin, on_epoch_end, on_train_begin, on_train_end,
        on_batch_begin, on_batch_end, ProgressCallback
 using .ModelSaver: save_model, load_model, save_checkpoint, load_checkpoint
+
+using .Logging: TrainingLogger, TensorBoardLogger, ExperimentTracker,
+                log_metrics!, flush_logs!,
+                create_experiment, setup_logging, LoggingCallback,
+                TensorBoardCallback, compare_experiments
 # ----------------------------------------------------------
 # Exportación final
 # ----------------------------------------------------------
@@ -183,7 +186,10 @@ export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero
        PrintCallback, FinalReportCallback,
        on_epoch_begin, on_epoch_end, on_train_begin, on_train_end,
        on_batch_begin, on_batch_end,f0, save_model, load_model, save_checkpoint, load_checkpoint,
-       ProgressCallback
+       ProgressCallback, TrainingLogger, TensorBoardLogger, ExperimentTracker,
+       log_metrics!, flush_logs!,
+       create_experiment, setup_logging, LoggingCallback,
+       TensorBoardCallback, compare_experiments
        
 
 end # module

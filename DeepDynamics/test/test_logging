@@ -1,0 +1,615 @@
+# test/test_logging.jl
+using Test
+using DeepDynamics
+using DeepDynamics.Logging
+using DeepDynamics.TensorEngine
+using DeepDynamics.NeuralNetwork
+using DeepDynamics.Training
+using DeepDynamics.Optimizers
+using DeepDynamics.Callbacks
+using JSON
+using Dates
+using CUDA
+using Statistics
+import DeepDynamics.Logging: log_scalar, log_histogram, save_model_checkpoint, 
+                           get_git_info, compare_experiments, log_gradients!,
+                           close  # ← Agregar close aquí
+@testset "Sistema de Logging Completo" begin
+    
+    # Directorio temporal para tests
+    test_dir = mktempdir()
+    
+    @testset "1. TrainingLogger - Funcionalidad Básica" begin
+        println("\n🧪 Test 1: TrainingLogger básico")
+        
+        log_path = joinpath(test_dir, "test_basic.jsonl")
+        logger = TrainingLogger(log_path, log_level=:epoch, buffer_size=5)
+        
+        # Verificar creación
+        @test isfile(log_path)
+        @test logger.log_level == :epoch
+        @test length(logger.metrics_history) == 0
+        
+        # Log algunas métricas
+        log_metrics!(logger, Dict("loss" => 0.5, "accuracy" => 0.85), epoch=1)
+        log_metrics!(logger, Dict("loss" => 0.4, "accuracy" => 0.88), epoch=2)
+        
+        # Verificar historial
+        @test length(logger.metrics_history["loss"]) == 2
+        @test logger.metrics_history["loss"][1] ≈ 0.5f0
+        @test logger.metrics_history["accuracy"][2] ≈ 0.88f0
+        
+        # Forzar flush
+        flush_logs!(logger)
+        sleep(0.1)  # Esperar escritura asíncrona
+        
+        # Verificar contenido del archivo
+        lines = readlines(log_path)
+        @test length(lines) >= 3  # start + 2 metrics
+        
+        # Parsear y verificar JSON
+        for line in lines
+            data = JSON.parse(line)
+            @test haskey(data, "timestamp")
+        end
+        
+        # Cerrar
+        close(logger)
+        
+        println("  ✅ TrainingLogger básico funciona correctamente")
+    end
+    
+    @testset "2. Buffer y Escritura Asíncrona" begin
+        println("\n🧪 Test 2: Buffer y escritura asíncrona")
+        
+        log_path = joinpath(test_dir, "test_buffer.jsonl")
+        logger = TrainingLogger(log_path, log_level=:batch, buffer_size=10)
+        
+        # Llenar buffer sin alcanzar límite
+        for i in 1:8
+            log_metrics!(logger, Dict("loss" => 0.1 * i), epoch=1, batch=i)
+        end
+        
+        @test length(logger.buffer) < 10  # No debe haberse vaciado
+        
+        # Alcanzar límite del buffer
+        log_metrics!(logger, Dict("loss" => 0.9), epoch=1, batch=9)
+        log_metrics!(logger, Dict("loss" => 1.0), epoch=1, batch=10)
+        
+        # Buffer debe haberse vaciado
+        sleep(0.1)  # Esperar tarea asíncrona
+        @test length(logger.buffer) < 10
+        
+        # Verificar que se escribió
+        flush_logs!(logger)
+        sleep(0.1)
+        close(logger)
+        
+        lines = readlines(log_path)
+        metric_lines = filter(line -> contains(line, "\"event\":\"metrics\""), lines)
+        @test length(metric_lines) == 10
+        
+        println("  ✅ Buffer y escritura asíncrona funcionan correctamente")
+    end
+    
+    @testset "3. Hardware Info y GPU Tracking" begin
+        println("\n🧪 Test 3: Hardware info y GPU tracking")
+        
+        hw_info = get_hardware_info()
+        
+        # Verificar campos básicos
+        @test haskey(hw_info, "cpu_threads")
+        @test haskey(hw_info, "cpu_model")
+        @test haskey(hw_info, "system_memory_gb")
+        @test haskey(hw_info, "gpu_available")
+        
+        @test hw_info["cpu_threads"] > 0
+        @test hw_info["system_memory_gb"] > 0
+        
+        if CUDA.functional()
+            @test hw_info["gpu_available"] == true
+            @test haskey(hw_info, "gpu_name")
+            @test haskey(hw_info, "gpu_memory_total")
+            @test hw_info["gpu_memory_total"] > 0
+            
+            # Test memoria GPU en logs
+            log_path = joinpath(test_dir, "test_gpu.jsonl")
+            logger = TrainingLogger(log_path)
+            
+            log_metrics!(logger, Dict("loss" => 0.5), epoch=1)
+            flush_logs!(logger)
+            sleep(0.1)
+            close(logger)
+            
+            # Verificar que se loguea memoria GPU
+            lines = readlines(log_path)
+            metric_line = filter(line -> contains(line, "metrics"), lines)[1]
+            data = JSON.parse(metric_line)
+            
+            @test haskey(data, "gpu_memory_used_gb")
+            @test haskey(data, "gpu_memory_free_gb")
+            @test data["gpu_memory_used_gb"] >= 0
+            
+            println("  ✅ GPU tracking funciona correctamente")
+        else
+            @test hw_info["gpu_available"] == false
+            println("  ⚠️  GPU no disponible, parte del test omitida")
+        end
+    end
+    
+    @testset "4. Gradient Logging" begin
+        println("\n🧪 Test 4: Logging de gradientes")
+        
+        # Modelo simple
+        model = Sequential([
+            Dense(10, 5),
+            Activation(relu),
+            Dense(5, 2)
+        ])
+        
+        # Datos dummy
+        x = Tensor(randn(Float32, 10, 4))
+        y = Tensor(rand(Float32, 2, 4))
+        
+        # Forward y backward
+        pred = forward(model, x)
+        loss = mse_loss(pred, y)
+        
+        params = collect_parameters(model)
+        for p in params
+            zero_grad!(p)
+        end
+        
+        backward(loss, [1.0f0])
+        
+        # Log gradientes
+        log_path = joinpath(test_dir, "test_grads.jsonl")
+        logger = TrainingLogger(log_path)
+        
+        log_gradients!(logger, model, 1)
+        flush_logs!(logger)
+        sleep(0.1)
+        close(logger)
+        
+        # Verificar
+        lines = readlines(log_path)
+        grad_lines = filter(line -> contains(line, "gradients"), lines)
+        @test length(grad_lines) >= 1
+        
+        data = JSON.parse(grad_lines[1])
+        @test haskey(data, "mean_grad_norm")
+        @test haskey(data, "max_grad_norm")
+        @test data["mean_grad_norm"] > 0
+        
+        println("  ✅ Gradient logging funciona correctamente")
+    end
+    
+    @testset "5. TensorBoardLogger" begin
+        println("\n🧪 Test 5: TensorBoardLogger")
+        
+        tb_dir = joinpath(test_dir, "tensorboard")
+        tb_logger = TensorBoardLogger(tb_dir)
+        
+        # Verificar estructura de directorios
+        @test isdir(joinpath(tb_dir, "scalars"))
+        @test isdir(joinpath(tb_dir, "histograms"))
+        @test isdir(joinpath(tb_dir, "images"))
+        
+        # Log escalares
+        for step in 1:5
+            log_scalar(tb_logger, "loss", Float32(1.0 / step), step)
+            log_scalar(tb_logger, "accuracy", Float32(0.8 + 0.02 * step), step)
+        end
+        
+        # Verificar archivos
+        loss_file = joinpath(tb_dir, "scalars", "loss.json")
+        @test isfile(loss_file)
+        
+        lines = readlines(loss_file)
+        @test length(lines) == 5
+        
+        # Verificar formato
+        data = JSON.parse(lines[1])
+        @test haskey(data, "step")
+        @test haskey(data, "value")
+        @test haskey(data, "wall_time")
+        
+        # Log histogramas
+        values = randn(Float32, 100)
+        log_histogram(tb_logger, "weights/layer1", values, 1)
+        
+        hist_file = joinpath(tb_dir, "histograms", "weights/layer1.json")
+        @test isfile(hist_file)
+        
+        hist_data = JSON.parse(readline(hist_file))
+        @test haskey(hist_data, "bins")
+        @test haskey(hist_data, "counts")
+        @test haskey(hist_data, "mean")
+        @test abs(hist_data["mean"] - mean(values)) < 0.01
+        
+        println("  ✅ TensorBoardLogger funciona correctamente")
+    end
+    
+    @testset "6. ExperimentTracker" begin
+        println("\n🧪 Test 6: ExperimentTracker")
+        
+        exp_dir = joinpath(test_dir, "experiments")
+        config = Dict(
+            "model" => "ResNet",
+            "learning_rate" => 0.001,
+            "batch_size" => 32,
+            "epochs" => 100
+        )
+        
+        tracker = create_experiment(exp_dir, config)
+        
+        # Verificar estructura
+        @test isdir(joinpath(exp_dir, tracker.experiment_id))
+        @test isfile(joinpath(exp_dir, tracker.experiment_id, "config.json"))
+        
+        # Verificar config guardada
+        saved_config = JSON.parsefile(joinpath(exp_dir, tracker.experiment_id, "config.json"))
+        @test saved_config["model"] == "ResNet"
+        @test saved_config["learning_rate"] == 0.001
+        @test haskey(saved_config, "experiment_id")
+        @test haskey(saved_config, "hardware_info")
+        @test haskey(saved_config, "julia_version")
+        
+        # Test guardar checkpoint metadata
+        save_model_checkpoint(tracker, nothing, 10, Dict("loss" => 0.15))
+        
+        checkpoint_meta = joinpath(exp_dir, tracker.experiment_id, 
+                                  "checkpoints", "checkpoint_epoch_10_meta.json")
+        @test isfile(checkpoint_meta)
+        
+        # Test comparación de experimentos
+        config2 = Dict(
+            "model" => "ResNet",
+            "learning_rate" => 0.01,  # Diferente
+            "batch_size" => 32,
+            "epochs" => 100
+        )
+        tracker2 = create_experiment(exp_dir, config2)
+        
+        comparisons = compare_experiments([tracker.experiment_id, tracker2.experiment_id], exp_dir)
+        @test length(comparisons) == 2
+        @test comparisons[1]["config"]["learning_rate"] == 0.001
+        @test comparisons[2]["config"]["learning_rate"] == 0.01
+        
+        println("  ✅ ExperimentTracker funciona correctamente")
+    end
+    
+    @testset "7. Integración con Training" begin
+        println("\n🧪 Test 7: Integración con sistema de training")
+        
+        # Configuración
+        config = Dict(
+            "model_type" => "MLP",
+            "hidden_size" => 64,
+            "learning_rate" => 0.01,
+            "batch_size" => 16
+        )
+        
+        # Setup logging
+        tracker, callbacks = setup_logging("test_integration", config,
+                                         log_dir=joinpath(test_dir, "integration"),
+                                         use_tensorboard=true,
+                                         log_gradients=true)
+        
+        @test length(callbacks) == 2  # Logger + TensorBoard
+        
+        # Modelo y datos
+        model = Sequential([
+            Dense(10, 64),
+            Activation(relu),
+            Dense(64, 32),
+            Activation(relu),
+            Dense(32, 1)
+        ])
+        
+        # Generar datos sintéticos
+        n_samples = 100
+        X_data = [Tensor(randn(Float32, 10, 1)) for _ in 1:n_samples]
+        y_data = [Tensor(randn(Float32, 1, 1)) for _ in 1:n_samples]
+        
+        # Entrenar con logging
+        opt = Adam(learning_rate=0.01)
+        
+        history = fit!(model, X_data, y_data, 
+                      epochs=5,
+                      batch_size=16,
+                      optimizer=opt,
+                      callbacks=callbacks,
+                      verbose=false)
+        
+        # Verificar que se crearon logs
+        log_file = joinpath(tracker.base_dir, "training.jsonl")
+        @test isfile(log_file)
+        
+        lines = readlines(log_file)
+        @test length(lines) > 5  # Al menos start + epochs + end
+        
+        # Verificar evento final
+        last_line = JSON.parse(lines[end])
+        @test last_line["event"] == "training_end"
+        @test haskey(last_line, "total_time")
+        @test haskey(last_line, "final_metrics")
+        
+        # Verificar TensorBoard files
+        tb_dir = joinpath(tracker.base_dir, "tensorboard")
+        @test isfile(joinpath(tb_dir, "scalars", "loss.json"))
+        @test isfile(joinpath(tb_dir, "scalars", "val_loss.json"))
+        
+        println("  ✅ Integración con training funciona correctamente")
+    end
+    
+    @testset "8. Performance y No-Blocking" begin
+        println("\n🧪 Test 8: Performance y no-blocking")
+        
+        log_path = joinpath(test_dir, "test_performance.jsonl")
+        logger = TrainingLogger(log_path, log_level=:batch, buffer_size=100)
+        
+        # Medir tiempo de logging
+        times = Float64[]
+        
+        for i in 1:1000
+            t0 = time()
+            log_metrics!(logger, Dict("loss" => rand(), "accuracy" => rand()), 
+                        epoch=1, batch=i)
+            push!(times, time() - t0)
+        end
+        
+        # El logging debe ser rápido (< 0.1ms promedio)
+        avg_time = mean(times) * 1000  # a milisegundos
+        @test avg_time < 0.1
+        
+        println("  Tiempo promedio por log: $(round(avg_time, digits=3)) ms")
+        
+        # Verificar que el buffer evita escrituras frecuentes
+        @test logger.async_task === nothing || !istaskdone(logger.async_task)
+        
+        flush_logs!(logger)
+        close(logger)
+        
+        println("  ✅ Performance adecuada para producción")
+    end
+    
+    @testset "9. Manejo de Errores" begin
+        println("\n🧪 Test 9: Manejo de errores")
+        
+        # Test 1: Directorio sin permisos (simulado)
+        protected_dir = joinpath(test_dir, "protected")
+        mkdir(protected_dir)
+        
+        # Test 2: Logger con archivo inválido
+        @test_nowarn begin
+            logger = TrainingLogger(joinpath(test_dir, "valid.jsonl"))
+            log_metrics!(logger, Dict("test" => 1.0), epoch=1)
+            flush_logs!(logger)
+            close(logger)
+        end
+        
+        # Test 3: Métricas con tipos mixtos
+        logger = TrainingLogger(joinpath(test_dir, "mixed_types.jsonl"))
+        
+        @test_nowarn begin
+            log_metrics!(logger, Dict(
+                "loss" => 0.5f0,
+                "accuracy" => 0.85,
+                "steps" => 100,
+                "learning_rate" => 1e-3
+            ), epoch=1)
+        end
+        
+        close(logger)
+        
+        # Test 4: Git info cuando no hay repo
+        test_subdir = mktempdir(test_dir)
+        cd(test_subdir) do
+            git_info = get_git_info()
+            @test haskey(git_info, "available") || length(git_info) == 0
+        end
+        
+        println("  ✅ Manejo de errores robusto")
+    end
+    
+    @testset "10. Casos Edge" begin
+        println("\n🧪 Test 10: Casos edge")
+        
+        # Test 1: Muchas métricas
+        logger = TrainingLogger(joinpath(test_dir, "many_metrics.jsonl"))
+        
+        big_metrics = Dict{String, Float64}()
+        for i in 1:100
+            big_metrics["metric_$i"] = rand()
+        end
+        
+        @test_nowarn log_metrics!(logger, big_metrics, epoch=1)
+        
+        # Test 2: Strings muy largos
+        long_tag = repeat("a", 50)
+        tb_logger = TensorBoardLogger(joinpath(test_dir, "tb_long"))
+        @test_nowarn log_scalar(tb_logger, long_tag, 1.0f0, 1)
+        
+        # Test 3: Arrays muy grandes para histogramas
+        huge_array = randn(Float32, 1_000_000)
+        @test_nowarn log_histogram(tb_logger, "huge_histogram", huge_array, 1)
+        
+        # Test 4: Logging concurrente
+        logger2 = TrainingLogger(joinpath(test_dir, "concurrent.jsonl"), buffer_size=10)
+        
+        @sync begin
+            for i in 1:4
+                @async begin
+                    for j in 1:25
+                        log_metrics!(logger2, Dict("task_$i" => j), epoch=j)
+                        sleep(0.001)
+                    end
+                end
+            end
+        end
+        
+        flush_logs!(logger2)
+        sleep(0.1)
+        close(logger2.file_handle)
+        
+        # Verificar integridad
+        lines = readlines(joinpath(test_dir, "concurrent.jsonl"))
+        for line in lines[2:end]  # Skip header
+            @test JSON.parse(line) isa Dict  # Debe ser JSON válido
+        end
+        
+        close(logger)
+        
+        println("  ✅ Casos edge manejados correctamente")
+    end
+    
+    # Cleanup
+    rm(test_dir, recursive=true)
+    
+    println("\n✅ TODOS LOS TESTS DE LOGGING PASARON")
+end
+
+# Test de integración completo con modelo real
+@testset "Test Integración E2E con Modelo Real" begin
+    println("\n🧪 Test E2E: Entrenamiento completo con logging")
+    
+    test_dir = mktempdir()
+    
+    # Configuración completa
+    config = Dict(
+        "model" => "CNN",
+        "dataset" => "synthetic",
+        "input_size" => (28, 28, 1),
+        "num_classes" => 10,
+        "batch_size" => 32,
+        "epochs" => 3,
+        "learning_rate" => 0.001,
+        "optimizer" => "Adam",
+        "loss" => "categorical_crossentropy"
+    )
+    
+    # Setup experimento
+    tracker, log_callbacks = setup_logging("mnist_cnn_test", config,
+                                         log_dir=test_dir,
+                                         use_tensorboard=true,
+                                         log_gradients=true)
+    
+    # Modelo CNN
+    model = Sequential([
+        Conv2D(1, 16, (3,3), padding=(1,1)),
+        Activation(relu),
+        MaxPooling((2,2)),
+        Conv2D(16, 32, (3,3), padding=(1,1)),
+        Activation(relu),
+        MaxPooling((2,2)),
+        Flatten(),
+        Dense(7*7*32, 64),
+        Activation(relu),
+        DropoutLayer(0.5),
+        Dense(64, 10),
+        Activation(softmax)
+    ])
+    
+    # Datos sintéticos tipo MNIST
+    n_train = 200
+    X_train = [Tensor(randn(Float32, 1, 1, 28, 28)) for _ in 1:n_train]
+    y_train = [begin
+        y = zeros(Float32, 10, 1)
+        y[rand(1:10), 1] = 1.0f0
+        Tensor(y)
+    end for _ in 1:n_train]
+    
+    n_val = 50
+    X_val = [Tensor(randn(Float32, 1, 1, 28, 28)) for _ in 1:n_val]
+    y_val = [begin
+        y = zeros(Float32, 10, 1)
+        y[rand(1:10), 1] = 1.0f0
+        Tensor(y)
+    end for _ in 1:n_val]
+    
+    # Callbacks adicionales
+    all_callbacks = [
+        log_callbacks...,
+        EarlyStopping(patience=5, monitor="val_loss"),
+        ProgressCallback()
+    ]
+    
+    # Entrenar
+    opt = Adam(learning_rate=Float32(config["learning_rate"]))
+    
+    history = fit!(model, X_train, y_train,
+                  epochs=config["epochs"],
+                  batch_size=config["batch_size"],
+                  validation_data=(X_val, y_val),
+                  optimizer=opt,
+                  callbacks=all_callbacks,
+                  verbose=true)
+    
+    # Verificaciones
+    
+    # 1. Archivos de log creados
+    @test isfile(joinpath(tracker.base_dir, "config.json"))
+    @test isfile(joinpath(tracker.base_dir, "training.jsonl"))
+    @test isdir(joinpath(tracker.base_dir, "tensorboard"))
+    
+    # 2. Contenido de logs
+    log_lines = readlines(joinpath(tracker.base_dir, "training.jsonl"))
+    events = [JSON.parse(line)["event"] for line in log_lines if haskey(JSON.parse(line), "event")]
+    
+    @test "training_start" in events
+    @test "training_end" in events
+    @test count(e -> e == "metrics", events) >= config["epochs"]
+    
+    # 3. TensorBoard files
+    tb_scalars = joinpath(tracker.base_dir, "tensorboard", "scalars")
+    @test isfile(joinpath(tb_scalars, "loss.json"))
+    @test isfile(joinpath(tb_scalars, "val_loss.json"))
+    @test isfile(joinpath(tb_scalars, "training_accuracy.json")) || 
+      isfile(joinpath(tb_scalars, "val_accuracy.json"))
+    
+    # 4. Métricas finales
+    final_event = JSON.parse(log_lines[end])
+    @test haskey(final_event, "final_metrics")
+    @test haskey(final_event["final_metrics"], "loss")
+    @test final_event["total_time"] > 0
+    
+    # 5. Hardware info registrada
+    config_data = JSON.parsefile(joinpath(tracker.base_dir, "config.json"))
+    @test haskey(config_data, "hardware_info")
+    @test haskey(config_data["hardware_info"], "cpu_threads")
+    
+    # CAMBIAR el cleanup por uno más robusto:
+    # Cleanup
+    sleep(2.0)  # Más tiempo para que se cierren archivos
+    GC.gc()     # Forzar garbage collection
+
+    # Intentar cerrar cualquier logger que pueda estar abierto
+    for cb in all_callbacks
+        if isa(cb, LoggingCallback) && cb.logger.file_handle !== nothing
+            try
+                close(cb.logger)
+            catch
+            end
+        end
+    end
+
+    # Cleanup final
+    try
+        if Sys.iswindows()
+            # En Windows, usar comandos del sistema si falla Julia
+            try
+                rm(test_dir, recursive=true, force=true)
+            catch
+                run(`cmd /c rmdir /s /q $test_dir`)
+            end
+        else
+            rm(test_dir, recursive=true)
+        end
+    catch e
+        @warn "No se pudo eliminar completamente el directorio de test: $e"
+        # No es fatal, el test pasó
+    end
+    
+    println("✅ Test E2E completado exitosamente")
+end

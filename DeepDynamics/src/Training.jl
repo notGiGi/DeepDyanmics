@@ -29,7 +29,7 @@ using ..Metrics: accuracy, mae, rmse, binary_accuracy
 const optim_step! = Optimizers.step!
 const AnyDataLoader = Union{DataLoader, DataLoaders.OptimizedDataLoader}   
 
-
+using ..Logging: setup_logging
   
 
 # -----------------------------------------------------------------------
@@ -155,14 +155,32 @@ end
 Entrena el modelo usando DataLoader con soporte completo para callbacks y métricas.
 Soporta tanto DataLoader estándar como OptimizedDataLoader.
 """
-function fit!(model::Sequential, train_loader::AnyDataLoader;
+function fit!(model::Sequential,
+              train_loader::AnyDataLoader;
               val_loader::Union{AnyDataLoader, Nothing}=nothing,
               optimizer=Adam(0.001f0),
               loss_fn=mse_loss,
               epochs::Int=10,
               callbacks::Vector{<:AbstractCallback}=AbstractCallback[],
-              verbose::Int=1)
-    
+              verbose::Int=1,
+              validation_data::Union{Nothing, Tuple{Any,Any}}=nothing,
+              log_dir::Union{Nothing,String}=nothing,
+              experiment_name::Union{Nothing,String}=nothing,
+              log_config::Dict            = Dict(),   # ← sin parámetros de tipo
+              use_tensorboard::Bool       = false,
+              log_gradients::Bool         = false)
+
+
+    batch_size = hasproperty(train_loader, :batch_size) ? 
+                    train_loader.batch_size : 
+                    error("No pude inferir batch_size desde $(typeof(train_loader))")
+
+    # Si vienen datos de validación por este keyword, los usamos
+    if validation_data !== nothing
+        Xv, yv = validation_data
+        val_loader = DataLoader(Xv, yv, batch_size; shuffle=false)
+    end
+        
     # Convertir callbacks a tipo correcto
     callbacks = Vector{AbstractCallback}(callbacks)
     
@@ -175,7 +193,33 @@ function fit!(model::Sequential, train_loader::AnyDataLoader;
     if verbose > 1
         push!(callbacks, ProgressCallback(verbose))
     end
-    
+    if log_dir !== nothing && experiment_name !== nothing
+        # Configurar experimento
+        exp_config = merge(Dict{String, Any}(
+            "model_type" => string(typeof(model)),
+            "epochs" => epochs,
+            "batch_size" => isdefined(train_loader, :batch_size) ? train_loader.batch_size : 32,
+            "optimizer" => string(typeof(optimizer)),
+            "learning_rate" => optimizer.learning_rate,
+            "loss_fn" => string(loss_fn)
+        ), Dict{String, Any}(log_config))  # ← Convertir log_config al tipo correcto
+        
+        # Crear tracker y callbacks de logging
+        tracker, log_callbacks = setup_logging(
+            experiment_name,
+            exp_config,
+            log_dir=log_dir,
+            use_tensorboard=use_tensorboard,
+            log_gradients=log_gradients
+        )
+        
+        # Agregar callbacks de logging a la lista existente
+        append!(callbacks, log_callbacks)
+        
+        if verbose > 0
+            println("📊 Logging habilitado en: $(tracker.base_dir)")
+        end
+    end    
     # Inicializar historia
     history = History()
     params = collect_parameters(model)
@@ -381,7 +425,9 @@ function fit!(model::Sequential, train_loader::AnyDataLoader;
         epoch_logs[:val_loss] = val_loss
         epoch_logs[:val_accuracy] = val_acc
         epoch_logs[:time] = time() - epoch_start_time
-        
+        epoch_logs[:training_loss] = train_loss      # ← AGREGAR
+        epoch_logs[:training_accuracy] = train_acc   # ← AGREGAR
+        epoch_logs[:model] = model                   # ← AGREGAR (punto 3)
         # on_epoch_end para todos los callbacks
         should_stop = false
         for cb in callbacks
@@ -430,8 +476,10 @@ function fit!(model::Sequential, train_loader::AnyDataLoader;
 end
 
 
-function fit!(model::Sequential, X_train::Vector{<:Tensor}, y_train::Vector{<:Tensor};
-              X_val=nothing, y_val=nothing,
+function fit!(model::Sequential,
+              X_train::Vector{<:Tensor}, y_train::Vector{<:Tensor};
+              X_val=nothing,
+              y_val=nothing,
               optimizer=Adam(0.001f0),
               loss_fn=mse_loss,
               epochs::Int=10,
@@ -440,8 +488,47 @@ function fit!(model::Sequential, X_train::Vector{<:Tensor}, y_train::Vector{<:Te
               shuffle::Bool=true,
               callbacks::AbstractVector{<:AbstractCallback}=AbstractCallback[],
               verbose::Bool=true,
-              metrics::Vector{Symbol}=[:accuracy])
+              metrics::Vector{Symbol} = [:accuracy],
+              validation_data::Union{Nothing, Tuple{Vector{<:Tensor},Vector{<:Tensor}}}=nothing,
+              log_dir::Union{Nothing,String}=nothing,
+              experiment_name::Union{Nothing,String}=nothing,
+              log_config::Dict            = Dict(),   # ← sin parámetros de tipo
+              use_tensorboard::Bool       = false,
+              log_gradients::Bool         = false)
+
+    # Desempaquetar validation_data si llega por este keyword
+    if validation_data !== nothing
+        X_val, y_val = validation_data
+    end
     
+    if log_dir !== nothing && experiment_name !== nothing
+        # Configurar experimento
+        exp_config = merge(Dict(
+            "model_type" => string(typeof(model)),
+            "epochs" => epochs,
+            "batch_size" => batch_size,
+            "optimizer" => string(typeof(optimizer)),
+            "learning_rate" => optimizer.learning_rate,
+            "loss_fn" => string(loss_fn)
+        ), log_config)
+        
+        # Crear tracker y callbacks de logging
+        tracker, log_callbacks = setup_logging(
+            experiment_name,
+            exp_config,
+            log_dir=log_dir,
+            use_tensorboard=use_tensorboard,
+            log_gradients=log_gradients
+        )
+        
+        # Agregar callbacks de logging a la lista existente
+        append!(callbacks, log_callbacks)
+        
+        if verbose
+            println("📊 Logging habilitado en: $(tracker.base_dir)")
+        end
+    end
+
     # Validación de inputs
     @assert length(X_train) == length(y_train) "X_train y y_train deben tener el mismo tamaño"
     @assert 0 <= validation_split < 1 "validation_split debe estar en [0, 1)"
@@ -578,14 +665,22 @@ function fit!(model::Sequential, X_train::Vector{<:Tensor}, y_train::Vector{<:Te
         push!(history.train_loss, avg_train_loss)
         push!(logs[:train_losses], Float64(avg_train_loss))
         epoch_logs[:loss] = avg_train_loss
-        
+        epoch_logs[:training_loss] = avg_train_loss  # Para compatibilidad con TensorBoard
+
+
         for metric in metrics
             avg_value = train_metric_sums[metric] / train_batches
             if !haskey(history.train_metrics, string(metric))
                 history.train_metrics[string(metric)] = Float32[]
             end
             push!(history.train_metrics[string(metric)], avg_value)
-            epoch_logs[Symbol("train_$metric")] = avg_value
+            
+            # Usar nombres estándar para métricas comunes
+            if metric == :accuracy
+                epoch_logs[:training_accuracy] = avg_value  # ← AQUÍ, DENTRO del bucle
+            else
+                epoch_logs[Symbol("train_$metric")] = avg_value
+            end
         end
         
         # === FASE DE VALIDACIÓN ===
@@ -625,12 +720,17 @@ function fit!(model::Sequential, X_train::Vector{<:Tensor}, y_train::Vector{<:Te
             epoch_logs[:val_loss] = avg_val_loss
             
             for metric in metrics
-                avg_value = val_metric_sums[metric] / val_batches
+                avg_value = val_metric_sums[metric] / val_batches  # ← val_metric_sums, NO train_metric_sums
                 if !haskey(history.val_metrics, string(metric))
                     history.val_metrics[string(metric)] = Float32[]
                 end
                 push!(history.val_metrics[string(metric)], avg_value)
-                epoch_logs[Symbol("val_$metric")] = avg_value
+                
+                if metric == :accuracy
+                    epoch_logs[:val_accuracy] = avg_value
+                else
+                    epoch_logs[Symbol("val_$metric")] = avg_value
+                end
             end
         end
         

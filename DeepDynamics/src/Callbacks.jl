@@ -1,8 +1,9 @@
 module Callbacks
-
+using CUDA
 using ..TensorEngine
 using ..NeuralNetwork
 using ..Optimizers
+using ..Layers
 #using ..Reports  # Para FinalReportCallback
 using JLD2
 using Printf
