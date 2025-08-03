@@ -582,7 +582,7 @@ function fit!(model::Sequential,
         :train_losses => Float64[],
         :val_losses => Float64[]
     )
-    
+    logs[:history] = history
     # on_train_begin
     for cb in callbacks
         on_train_begin(cb, logs)

@@ -95,10 +95,11 @@ include("ModelSaver.jl")
 include("Callbacks.jl")
 include("Logging.jl")
 include("Metrics.jl")
-include("Reports.jl")
 include("DataLoaders.jl")
 include("Visualizations.jl")
 include("Training.jl")
+include("ReportGenerator.jl")
+include("Reports.jl")
 include("TextUtils.jl")
 include("ImageProcessing.jl")
 include("UNetSegmentation.jl")
@@ -153,6 +154,9 @@ using .Logging: TrainingLogger, TensorBoardLogger, ExperimentTracker,
                 log_metrics!, flush_logs!,
                 create_experiment, setup_logging, LoggingCallback,
                 TensorBoardCallback, compare_experiments
+using .ReportGenerator
+
+
 # ----------------------------------------------------------
 # Exportación final
 # ----------------------------------------------------------
@@ -189,7 +193,8 @@ export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero
        ProgressCallback, TrainingLogger, TensorBoardLogger, ExperimentTracker,
        log_metrics!, flush_logs!,
        create_experiment, setup_logging, LoggingCallback,
-       TensorBoardCallback, compare_experiments
+       TensorBoardCallback, compare_experiments, generate_training_report, ReportTemplate, ReportCallback,
+       create_default_template, export_to_pdf, export_to_latex
        
 
 end # module
