@@ -149,8 +149,8 @@ using .Callbacks: AbstractCallback, EarlyStopping, ReduceLROnPlateau, ModelCheck
        PrintCallback, FinalReportCallback,
        on_epoch_begin, on_epoch_end, on_train_begin, on_train_end,
        on_batch_begin, on_batch_end, ProgressCallback
-using .ModelSaver: save_model, load_model, save_checkpoint, load_checkpoint
-
+using .ModelSaver: save_model, load_model, save_checkpoint, load_checkpoint,
+       ModelBundle, ModelRegistry, register_model, get_model, list_models
 using .Logging: TrainingLogger, TensorBoardLogger, ExperimentTracker,
                 log_metrics!, flush_logs!,
                 create_experiment, setup_logging, LoggingCallback,
@@ -197,7 +197,8 @@ export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero
        create_experiment, setup_logging, LoggingCallback,
        TensorBoardCallback, compare_experiments, generate_training_report, ReportTemplate, ReportCallback,
        create_default_template, export_to_pdf, export_to_latex, WandBLogger, MLFlowLogger, create_mlops_logger,
-       sync_offline_runs, MLOpsConfig, safe_timestamp
+       sync_offline_runs, MLOpsConfig, safe_timestamp, ModelBundle, ModelRegistry, register_model, get_model, list_models,
+       register_model, get_model, list_models
        
 
 end # module
