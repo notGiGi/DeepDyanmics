@@ -94,6 +94,7 @@ include("Optimizers.jl")
 include("ModelSaver.jl")
 include("Callbacks.jl")
 include("Logging.jl")
+include("MLOpsIntegrations.jl")
 include("Metrics.jl")
 include("DataLoaders.jl")
 include("Visualizations.jl")
@@ -153,9 +154,10 @@ using .ModelSaver: save_model, load_model, save_checkpoint, load_checkpoint
 using .Logging: TrainingLogger, TensorBoardLogger, ExperimentTracker,
                 log_metrics!, flush_logs!,
                 create_experiment, setup_logging, LoggingCallback,
-                TensorBoardCallback, compare_experiments
+                TensorBoardCallback, compare_experiments, safe_timestamp
 using .ReportGenerator
-
+using .MLOpsIntegrations: WandBLogger, MLFlowLogger, create_mlops_logger,
+       sync_offline_runs, MLOpsConfig
 
 # ----------------------------------------------------------
 # Exportación final
@@ -194,7 +196,8 @@ export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero
        log_metrics!, flush_logs!,
        create_experiment, setup_logging, LoggingCallback,
        TensorBoardCallback, compare_experiments, generate_training_report, ReportTemplate, ReportCallback,
-       create_default_template, export_to_pdf, export_to_latex
+       create_default_template, export_to_pdf, export_to_latex, WandBLogger, MLFlowLogger, create_mlops_logger,
+       sync_offline_runs, MLOpsConfig, safe_timestamp
        
 
 end # module

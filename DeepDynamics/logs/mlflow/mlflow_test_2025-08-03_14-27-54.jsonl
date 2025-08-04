@@ -1,0 +1,1 @@
+{"event":"training_start","julia_version":"1.11.6","timestamp":"2025-08-03T14:27:54.406","hardware":{"cpu_model":"12th Gen Intel(R) Core(TM) i5-12450H","cuda_version":"12.6.0","gpu_available":true,"system_memory_gb":8.27961344,"gpu_name":"NVIDIA GeForce RTX 3050 Laptop GPU","gpu_memory_total":4.294443008,"cpu_threads":1}}

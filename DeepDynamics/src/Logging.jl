@@ -10,7 +10,7 @@ using ..TensorEngine
 using ..NeuralNetwork
 export close,TrainingLogger, TensorBoardLogger, ExperimentTracker,
        log_metrics!, flush_logs!, create_experiment, get_hardware_info, log_scalar, log_histogram, save_model_checkpoint, 
-        get_git_info, compare_experiments, log_gradients!
+        get_git_info, compare_experiments, log_gradients!, safe_timestamp
 import ..Callbacks: AbstractCallback, on_epoch_begin, on_batch_end, on_epoch_end, on_train_end
 import Base: close
 # ==================================================================
@@ -586,6 +586,12 @@ catch
         end
         return Histogram(collect(edges), weights)
     end
+end
+
+
+function safe_timestamp()
+    # Formato seguro para todos los sistemas operativos
+    return Dates.format(now(), "yyyy-mm-dd_HH-MM-SS-sss")
 end
 
 end # module
