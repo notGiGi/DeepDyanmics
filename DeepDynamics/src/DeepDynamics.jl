@@ -88,6 +88,7 @@ include("ConvolutionalLayers.jl")
 include("Layers.jl")
 include("EmbeddingLayer.jl")
 include("NeuralNetwork.jl")
+include("Inference.jl")
 include("Losses.jl")
 include("Utils.jl")
 include("Optimizers.jl")
@@ -158,7 +159,9 @@ using .Logging: TrainingLogger, TensorBoardLogger, ExperimentTracker,
 using .ReportGenerator
 using .MLOpsIntegrations: WandBLogger, MLFlowLogger, create_mlops_logger,
        sync_offline_runs, MLOpsConfig
-
+using .Inference: predict, predict_proba, predict_generator, PredictionPipeline,
+       quantize_model, warmup_model, TensorPool, get_tensor_from_pool!,
+       return_to_pool!
 # ----------------------------------------------------------
 # Exportación final
 # ----------------------------------------------------------
@@ -198,7 +201,9 @@ export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero
        TensorBoardCallback, compare_experiments, generate_training_report, ReportTemplate, ReportCallback,
        create_default_template, export_to_pdf, export_to_latex, WandBLogger, MLFlowLogger, create_mlops_logger,
        sync_offline_runs, MLOpsConfig, safe_timestamp, ModelBundle, ModelRegistry, register_model, get_model, list_models,
-       register_model, get_model, list_models
+       register_model, get_model, list_models, predict, predict_proba, predict_generator, PredictionPipeline,
+       quantize_model, warmup_model, TensorPool, get_tensor_from_pool!,
+       return_to_pool!
        
 
 end # module

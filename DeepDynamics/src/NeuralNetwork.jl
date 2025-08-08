@@ -15,9 +15,9 @@ export Sequential, Dense, Activation, collect_parameters,
        relu, softmax, sigmoid, tanh_activation, leaky_relu,
        model_to_gpu, model_to_cpu, model_device, model_to_device,
        layer_to_device, forward
-
 import ..Layers: BatchNorm
 import ..Layers: forward as batchnorm_forward
+
 # ==================================================================
 # Capa Dense Optimizada (Sin activación integrada)
 # ==================================================================
@@ -545,5 +545,6 @@ end
 function forward(layer::BatchNorm, input::Tensor)
     return batchnorm_forward(layer, input)
 end
+
 
 end # module NeuralNetwork
