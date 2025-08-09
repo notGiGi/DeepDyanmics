@@ -14,7 +14,7 @@ using ..ConvKernelLayers
 export Sequential, Dense, Activation, collect_parameters,
        relu, softmax, sigmoid, tanh_activation, leaky_relu,
        model_to_gpu, model_to_cpu, model_device, model_to_device,
-       layer_to_device, forward
+       layer_to_device, forward,swish, mish
 import ..Layers: BatchNorm
 import ..Layers: forward as batchnorm_forward
 
@@ -379,6 +379,10 @@ function collect_layer_parameters(layer)
         for sub in layer.shortcut
             append!(params, collect_layer_parameters(sub))
         end
+    elseif layer isa Layers.LayerNorm
+        for p in (layer.gamma, layer.beta)
+            push!(params, p isa Tensor ? p : Tensor(p; requires_grad=true))
+        end
     end
     
     return params
@@ -451,7 +455,24 @@ function layer_to_device(layer::ResidualBlock, device::Symbol)
 end
 
 
-
+function layer_to_device(layer::Layers.LayerNorm, device::Symbol)
+    ln_new = Layers.LayerNorm(
+        layer.normalized_shape;
+        eps=layer.eps,
+        training=layer.training
+    )
+    
+    # Mover gamma y beta al dispositivo correcto
+    if device == :gpu && CUDA.functional()
+        ln_new.gamma = TensorEngine.to_gpu(layer.gamma)
+        ln_new.beta = TensorEngine.to_gpu(layer.beta)
+    else
+        ln_new.gamma = TensorEngine.to_cpu(layer.gamma)
+        ln_new.beta = TensorEngine.to_cpu(layer.beta)
+    end
+    
+    return ln_new
+end
 
 function layer_to_device(layer, device::Symbol)
     # Capas sin parámetros (Flatten, Activation, Dropout, etc.)
@@ -546,5 +567,8 @@ function forward(layer::BatchNorm, input::Tensor)
     return batchnorm_forward(layer, input)
 end
 
+function forward(layer::Layers.LayerNorm, input::Tensor)
+    return Layers.forward(layer, input)
+end
 
 end # module NeuralNetwork

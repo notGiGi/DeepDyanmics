@@ -9,7 +9,7 @@ using Dates
 using ..TensorEngine: Tensor
 using ..NeuralNetwork: Sequential, Dense, Conv2D, collect_parameters, relu, sigmoid, tanh_activation, softmax, Activation
 using ..ConvolutionalLayers: MaxPooling, Conv2DTranspose
-using ..Layers: BatchNorm, Flatten, DropoutLayer, GlobalAvgPool
+using ..Layers: BatchNorm, Flatten, DropoutLayer, GlobalAvgPool, LayerNorm
 using ..Callbacks: AbstractCallback
  
 export plot_training_history, LivePlotter, plot_model_architecture, 
@@ -642,6 +642,12 @@ function extract_layer_info(model)
             info[:name] = "Conv2D($(in_channels)→$(out_channels), $kernel_str)"
             info[:params] = length(layer.weights.data) + length(layer.bias.data)
             info[:output_shape] = nothing
+        elseif layer_type <: LayerNorm
+            info[:type] = "LayerNorm"
+            shape_str = join(layer.normalized_shape, "×")
+            info[:name] = "LayerNorm($shape_str)"
+            info[:params] = length(layer.gamma.data) + length(layer.beta.data)
+            info[:output_shape] = layer.normalized_shape
             
         elseif layer_type <: MaxPooling
             info[:type] = "MaxPool"

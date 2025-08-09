@@ -25,9 +25,8 @@ function set_training_mode!(model, training::Bool)
             set_training_mode!(layer, training)
         end
     # Para capas específicas con campo training
-    elseif isa(model, Layers.BatchNorm) || isa(model, Layers.DropoutLayer)
+    elseif isa(model, Layers.BatchNorm) || isa(model, Layers.DropoutLayer) || isa(model, Layers.LayerNorm)
         model.training = training
-    # Para otras capas, no hacer nada
     end
     
     return model

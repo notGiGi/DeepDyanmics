@@ -1,7 +1,8 @@
 module Layers
 
 using NNlib, CUDA, ..TensorEngine, ..AbstractLayer, ..ConvKernelLayers, Statistics, ..ConvolutionalLayers
-export BatchNorm, Flatten, LayerActivation, set_training!, reset_running_stats!, GlobalAvgPool, ResidualBlock, create_residual_block, CustomFlatten, DropoutLayer
+export BatchNorm, Flatten, LayerActivation, set_training!, reset_running_stats!, GlobalAvgPool, ResidualBlock, create_residual_block, CustomFlatten, DropoutLayer,
+       LayerNorm
 
 
 # ==================================================================
@@ -906,6 +907,203 @@ function create_residual_block(in_channels, out_channels, stride=1)
     
     return ResidualBlock(conv_path, shortcut)
 end
+
+
+
+mutable struct LayerNorm <: AbstractLayer.Layer
+    normalized_shape::Tuple{Vararg{Int}}
+    gamma::TensorEngine.Tensor
+    beta::TensorEngine.Tensor
+    eps::Float32
+    training::Bool
+end
+
+function LayerNorm(normalized_shape::Union{Int, Tuple{Vararg{Int}}}; 
+                   eps::Float32=1f-5, training::Bool=true)
+    shape = normalized_shape isa Int ? (normalized_shape,) : normalized_shape
+    
+    gamma = TensorEngine.Tensor(ones(Float32, shape...); requires_grad=true)
+    beta = TensorEngine.Tensor(zeros(Float32, shape...); requires_grad=true)
+    
+    return LayerNorm(shape, gamma, beta, eps, training)
+end
+
+function forward(ln::LayerNorm, x::TensorEngine.Tensor)
+    x_shape = size(x.data)
+    ndims_x = ndims(x.data)
+    
+    # Determinar dimensiones de normalización basado en el formato
+    if ndims_x == 2  # Formato (features, batch)
+        # Normalizar sobre features (dimensión 1)
+        if x_shape[1] != ln.normalized_shape[1]
+            error("Shape mismatch: expected features=$(ln.normalized_shape[1]), got $(x_shape[1])")
+        end
+        
+        # Calcular estadísticas por sample (sobre features)
+        mean_x = mean(x.data; dims=1)  # Sin keepdims
+        var_x = var(x.data; dims=1, corrected=false)
+        
+        # Normalizar
+        x_normalized = (x.data .- mean_x) ./ sqrt.(var_x .+ ln.eps)
+        
+        # Aplicar scale y shift
+        # gamma y beta son (features,), necesitamos (features, 1) para broadcasting
+        gamma_reshaped = reshape(ln.gamma.data, :, 1)
+        beta_reshaped = reshape(ln.beta.data, :, 1)
+        
+    elseif ndims_x == 4  # Formato NCHW
+        # Para NCHW, normalizar sobre las últimas dimensiones según normalized_shape
+        n_norm_dims = length(ln.normalized_shape)
+        
+        if n_norm_dims == 1  # Normalizar solo sobre channels
+            if x_shape[2] != ln.normalized_shape[1]
+                error("Shape mismatch: expected channels=$(ln.normalized_shape[1]), got $(x_shape[2])")
+            end
+            
+            # Normalizar sobre canales para cada posición espacial
+            mean_x = mean(x.data; dims=2)  # Sin keepdims
+            var_x = var(x.data; dims=2, corrected=false)
+            
+            # gamma y beta son (C,), reshape a (1, C, 1, 1)
+            gamma_reshaped = reshape(ln.gamma.data, 1, :, 1, 1)
+            beta_reshaped = reshape(ln.beta.data, 1, :, 1, 1)
+            
+        elseif n_norm_dims == 3  # Normalizar sobre (C, H, W)
+            expected = (x_shape[2], x_shape[3], x_shape[4])
+            if expected != ln.normalized_shape
+                error("Shape mismatch: expected $(ln.normalized_shape), got $expected")
+            end
+            
+            # Normalizar sobre las últimas 3 dimensiones
+            mean_x = mean(x.data; dims=(2,3,4))  # Sin keepdims
+            var_x = var(x.data; dims=(2,3,4), corrected=false)
+            
+            # gamma y beta son (C, H, W), reshape a (1, C, H, W)
+            gamma_reshaped = reshape(ln.gamma.data, 1, size(ln.gamma.data)...)
+            beta_reshaped = reshape(ln.beta.data, 1, size(ln.beta.data)...)
+        else
+            error("Invalid normalized_shape for 4D input: $(ln.normalized_shape)")
+        end
+        
+        x_normalized = (x.data .- mean_x) ./ sqrt.(var_x .+ ln.eps)
+        
+    else
+        error("LayerNorm only supports 2D (features, batch) or 4D (NCHW) inputs, got $(ndims_x)D")
+    end
+    
+    # Aplicar transformación afín
+    y = x_normalized .* gamma_reshaped .+ beta_reshaped
+    
+    out = TensorEngine.Tensor(y; requires_grad=x.requires_grad)
+    
+        if out.requires_grad
+            # Guardar para backward
+            saved_normalized = x_normalized
+            saved_var = var_x
+            saved_mean = mean_x
+            saved_gamma_reshaped = gamma_reshaped
+            
+            out.backward_fn = function(grad)
+        # Asegurar que grad esté en el dispositivo correcto
+        grad_data = grad isa TensorEngine.Tensor ? grad.data : grad
+        
+        # Detectar dispositivo
+        is_on_gpu = grad_data isa CUDA.CuArray
+        
+        # Gradientes para gamma y beta
+        if ndims_x == 2
+            grad_gamma = vec(sum(grad_data .* saved_normalized; dims=2))
+            grad_beta = vec(sum(grad_data; dims=2))
+            norm_dims = 1
+        elseif ndims_x == 4 && length(ln.normalized_shape) == 1
+            grad_gamma = vec(sum(grad_data .* saved_normalized; dims=(1,3,4)))
+            grad_beta = vec(sum(grad_data; dims=(1,3,4)))
+            norm_dims = 2
+        else  # 4D con normalización completa
+            grad_gamma = dropdims(sum(grad_data .* saved_normalized; dims=1); dims=1)
+            grad_beta = dropdims(sum(grad_data; dims=1); dims=1)
+            norm_dims = (2,3,4)
+        end
+        
+        # Acumular gradientes - CORREGIDO para GPU
+        if ln.gamma.grad === nothing
+            if is_on_gpu
+                ln.gamma.grad = TensorEngine.Tensor(CUDA.zeros(Float32, size(ln.gamma.data)))
+            else
+                ln.gamma.grad = TensorEngine.Tensor(zeros(Float32, size(ln.gamma.data)))
+            end
+        end
+        if ln.beta.grad === nothing
+            if is_on_gpu
+                ln.beta.grad = TensorEngine.Tensor(CUDA.zeros(Float32, size(ln.beta.data)))
+            else
+                ln.beta.grad = TensorEngine.Tensor(zeros(Float32, size(ln.beta.data)))
+            end
+        end
+        
+        # Asegurar que los gradientes acumulados estén en el mismo dispositivo
+        if is_on_gpu
+            # Si estamos en GPU, asegurar que gamma.grad y beta.grad también lo estén
+            if !(ln.gamma.grad.data isa CUDA.CuArray)
+                ln.gamma.grad = TensorEngine.Tensor(CUDA.CuArray(ln.gamma.grad.data))
+            end
+            if !(ln.beta.grad.data isa CUDA.CuArray)
+                ln.beta.grad = TensorEngine.Tensor(CUDA.CuArray(ln.beta.grad.data))
+            end
+            
+            # Ahora acumular (todo en GPU)
+            grad_gamma_reshaped = CUDA.reshape(grad_gamma, size(ln.gamma.data))
+            grad_beta_reshaped = CUDA.reshape(grad_beta, size(ln.beta.data))
+        else
+            # En CPU
+            grad_gamma_reshaped = reshape(grad_gamma, size(ln.gamma.data))
+            grad_beta_reshaped = reshape(grad_beta, size(ln.beta.data))
+        end
+        
+        # Acumular
+        ln.gamma.grad.data .+= grad_gamma_reshaped
+        ln.beta.grad.data .+= grad_beta_reshaped
+        
+        # Gradiente para x (resto del código igual)
+        N = prod(size(x.data)) ÷ prod(size(saved_mean))
+        
+        grad_normalized = grad_data .* saved_gamma_reshaped
+        std_inv = 1f0 ./ sqrt.(saved_var .+ ln.eps)
+        
+        # Calcular gradiente de x
+        if ndims_x == 2
+            grad_var = sum(grad_normalized .* (x.data .- saved_mean) .* (-0.5f0) .* (std_inv .^ 3f0); dims=norm_dims)
+            grad_mean = sum(grad_normalized .* (-std_inv); dims=norm_dims)
+            grad_x = (grad_normalized .* std_inv) .+ 
+                    (grad_var .* 2f0 .* (x.data .- saved_mean) ./ N) .+ 
+                    (grad_mean ./ N)
+        else
+            # Para 4D, manejar las dimensiones correctamente
+            grad_var = sum(grad_normalized .* (x.data .- saved_mean) .* (-0.5f0) .* (std_inv .^ 3f0); dims=norm_dims)
+            grad_mean = sum(grad_normalized .* (-std_inv); dims=norm_dims)
+            grad_x = (grad_normalized .* std_inv) .+ 
+                    (grad_var .* 2f0 .* (x.data .- saved_mean) ./ N) .+ 
+                    (grad_mean ./ N)
+        end
+        
+        TensorEngine.backward(x, TensorEngine.Tensor(grad_x; requires_grad=false))
+    end
+    end
+    
+    return out
+end
+
+# Hacer LayerNorm callable
+function (ln::LayerNorm)(input::TensorEngine.Tensor)
+    return forward(ln, input)
+end
+
+function set_training!(ln::LayerNorm, mode::Bool)
+    ln.training = mode
+    return ln
+end
+
+
 
 
 

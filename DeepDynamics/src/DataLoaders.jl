@@ -52,6 +52,28 @@ function Base.iterate(dl::DataLoader, state=1)
     return (batch_data, batch_labels), end_idx + 1
 end
 
+# -----------------------------------------------------------------------------
+# Outer constructor para matrices: convierte cada columna en un Tensor y luego
+# llama al constructor de vectores existente.
+# -----------------------------------------------------------------------------
+function DataLoader(
+    data::AbstractMatrix{T},
+    labels::AbstractMatrix{S},
+    batch_size::Int;
+    shuffle::Bool = true
+) where {T, S}
+    n_samples = size(data, 2)
+    @assert size(labels, 2) == n_samples "Data y labels deben tener el mismo número de muestras: got $(n_samples) vs $(size(labels,2))"
+    # Envuelve cada columna en un TensorEngine.Tensor (sin gradiente por defecto)
+    data_vec = [ TensorEngine.Tensor(data[:, i]; requires_grad=false)
+                 for i in 1:n_samples ]
+    labels_vec = [ TensorEngine.Tensor(labels[:, i]; requires_grad=false)
+                   for i in 1:n_samples ]
+
+    return DataLoader(data_vec, labels_vec, batch_size; shuffle=shuffle)
+end
+
+
 Base.length(dl::DataLoader) = Int(ceil(length(dl.data) / dl.batch_size))
 
 # Estructura para manejar data loaders optimizados con limpieza

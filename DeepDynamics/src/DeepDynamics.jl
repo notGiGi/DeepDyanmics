@@ -109,6 +109,23 @@ include("PretrainedModels.jl")
 include("LRSchedulers.jl")
 include("Models.jl")
 
+"""
+    zero_grad!(model::Sequential)
+
+Reinicia los gradientes de todos los parámetros del modelo.
+Conveniencia para evitar iterar manualmente sobre los parámetros.
+"""
+function TensorEngine.zero_grad!(model::NeuralNetwork.Sequential)
+    params = NeuralNetwork.collect_parameters(model)
+    for p in params
+        if p.requires_grad
+            TensorEngine.zero_grad!(p)
+        end
+    end
+    return nothing
+end
+
+
 # ----------------------------------------------------------
 # Imports y Reexports principales
 # ----------------------------------------------------------
@@ -121,13 +138,13 @@ using .Visualizations
 using .ReshapeModule: Reshape
 using .Losses: binary_crossentropy, categorical_crossentropy,binary_crossentropy_with_logits
 using .Layers: BatchNorm, set_training!, reset_running_stats!, Flatten,
-               swish, mish, GlobalAvgPool, DropoutLayer, LayerActivation
+               GlobalAvgPool, DropoutLayer, LayerActivation, LayerNorm
 using .ConvolutionalLayers: Conv2D, MaxPooling, Conv2DTranspose
 using .EmbeddingLayer: Embedding, embedding_forward
 using .NeuralNetwork: Sequential, Dense, Activation, collect_parameters,
                       relu, softmax, sigmoid, tanh_activation, leaky_relu,
                       model_to_gpu, model_to_cpu, model_device, model_to_device,
-                      layer_to_device, forward
+                      layer_to_device, forward,swish, mish
 using .Optimizers: SGD, Adam, RMSProp, Adagrad, Nadam, step! as optim_step!
 using .Metrics: accuracy, mae, rmse, f1_score, precision, recall, binary_accuracy
 using .Reports
@@ -203,7 +220,7 @@ export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero
        sync_offline_runs, MLOpsConfig, safe_timestamp, ModelBundle, ModelRegistry, register_model, get_model, list_models,
        register_model, get_model, list_models, predict, predict_proba, predict_generator, PredictionPipeline,
        quantize_model, warmup_model, TensorPool, get_tensor_from_pool!,
-       return_to_pool!
+       return_to_pool!, LayerNorm,swish, mish
        
 
 end # module

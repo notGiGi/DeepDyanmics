@@ -405,6 +405,12 @@ function extract_architecture(model)
             # Flatten
             elseif isa(layer, Layers.Flatten)
                 info["layer_type"] = "Flatten"
+            elseif isa(layer, Layers.LayerNorm)
+                info["num_features"] = layer.normalized_shape  # Tupla completa
+                info["eps"] = layer.eps
+                # Guardar parámetros en la estructura
+                info["gamma"] = Array(layer.gamma.data)
+                info["beta"] = Array(layer.beta.data)
             end
             
             push!(layer_info, info)
@@ -465,6 +471,17 @@ function reconstruct_model(layer_info)
                 info["in_features"],
                 info["out_features"]
             )
+        elseif contains(layer_type, "LayerNorm")
+            shape = Tuple(info["num_features"])  # Convertir de vuelta a tupla
+            layer = Layers.LayerNorm(
+                shape;
+                eps=get(info, "eps", 1f-5)
+            )
+            # Restaurar parámetros si existen
+            if haskey(info, "gamma")
+                layer.gamma.data .= info["gamma"]
+                layer.beta.data .= info["beta"]
+            end    
         elseif contains(layer_type, "Conv2D")
             layer = ConvolutionalLayers.Conv2D(
                 info["in_channels"],
@@ -479,6 +496,7 @@ function reconstruct_model(layer_info)
                 momentum=info["momentum"],
                 epsilon=info["epsilon"]
             )
+        
             if haskey(info, "running_mean")
                 layer.running_mean = copy(info["running_mean"])
                 layer.running_var = copy(info["running_var"])
