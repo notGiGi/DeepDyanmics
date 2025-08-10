@@ -413,7 +413,7 @@ function Base.:-(scalar::Number, t::Tensor)
     return result
 end
 
-# Reemplaza la función backward en TensorEngine.jl con esta versión
+
 function backward(t::Tensor, grad::Union{Tensor, AbstractArray})
     # Verificar si requiere gradientes
     if !t.requires_grad

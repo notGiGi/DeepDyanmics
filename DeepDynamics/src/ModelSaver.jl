@@ -365,7 +365,25 @@ function extract_architecture(model)
             # Dropout
             elseif isa(layer, Layers.DropoutLayer)
                 info["rate"] = layer.rate
-                
+
+            elseif isa(layer, Layers.RNNCell)
+                info["input_size"]  = layer.input_size
+                info["hidden_size"] = layer.hidden_size
+                info["has_bias"]    = (layer.b_ih !== nothing)
+                info["activation"]  = string(layer.activation)
+
+            elseif isa(layer, Layers.RNN)
+                cell_info = Dict{String,Any}()
+                cell      = layer.cell
+                cell_info["input_size"]  = cell.input_size
+                cell_info["hidden_size"] = cell.hidden_size
+                cell_info["has_bias"]    = (cell.b_ih !== nothing)
+                cell_info["activation"]  = string(cell.activation)
+
+                info["cell_info"]        = cell_info
+                info["batch_first"]      = layer.batch_first
+                info["return_sequences"] = layer.return_sequences
+
             # Activation - guardar el tipo en lugar del campo fn
             elseif isa(layer, NeuralNetwork.Activation)
                 # Identificar la función por comparación o string
@@ -481,7 +499,28 @@ function reconstruct_model(layer_info)
             if haskey(info, "gamma")
                 layer.gamma.data .= info["gamma"]
                 layer.beta.data .= info["beta"]
-            end    
+            end
+
+
+        elseif contains(layer_type, "RNNCell")
+            layer = Layers.RNNCell(
+                info["input_size"],
+                info["hidden_size"];
+                bias = info["has_bias"]
+            )
+
+        elseif contains(layer_type, "RNN")
+            cell_info = info["cell_info"]
+            cell = Layers.RNNCell(
+                cell_info["input_size"],
+                cell_info["hidden_size"];
+                bias = cell_info["has_bias"]
+            )
+            layer = Layers.RNN(cell.input_size, cell.hidden_size;
+                            batch_first = info["batch_first"],
+                            return_sequences = info["return_sequences"])
+            layer.cell = cell
+
         elseif contains(layer_type, "Conv2D")
             layer = ConvolutionalLayers.Conv2D(
                 info["in_channels"],

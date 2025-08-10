@@ -27,9 +27,14 @@ function set_training_mode!(model, training::Bool)
     # Para capas específicas con campo training
     elseif isa(model, Layers.BatchNorm) || isa(model, Layers.DropoutLayer) || isa(model, Layers.LayerNorm)
         model.training = training
-    end
+   
+    elseif isa(model, Layers.RNNCell)
+        model.training = training
+    elseif isa(model, Layers.RNN)
+        model.cell.training = training
     
     return model
+    end
 end
 
 end  # module Utils

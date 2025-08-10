@@ -6,7 +6,8 @@ using Base.Threads
 using ..TensorEngine
 using ..GPUMemoryManager
 
-export DataLoader, optimized_data_loader, cleanup_data_loader!
+export DataLoader, optimized_data_loader, cleanup_data_loader!,
+       stack_indices_batch, stack_onehot_batch
 
 """
     DataLoader(data, labels, batch_size; shuffle=true)
@@ -302,5 +303,53 @@ end
 
 # Asegurar limpieza al salir
 atexit(cleanup_all_loaders!)
+
+"""
+    stack_indices_batch(xb::AbstractVector{<:TensorEngine.Tensor}) -> Tensor
+
+Apila un batch de secuencias índice (cada elemento es Tensor 1D de longitud T)
+en un Tensor 2D (N, T). Mantiene el device y usa Int32.
+"""
+function stack_indices_batch(xb::AbstractVector{<:TensorEngine.Tensor})
+    @assert !isempty(xb) "Batch vacío en stack_indices_batch"
+    N = length(xb)
+    @assert ndims(xb[1].data) == 1 "Cada elemento debe ser 1D; got ndims=$(ndims(xb[1].data))"
+    T = length(xb[1].data)
+
+    is_on_gpu = xb[1].data isa CUDA.CuArray
+    X = is_on_gpu ? CUDA.zeros(Int32, N, T) : Array{Int32}(undef, N, T)
+
+    @inbounds for i in 1:N
+        @assert ndims(xb[i].data) == 1 "Elemento $i no es 1D; ndims=$(ndims(xb[i].data))"
+        @assert length(xb[i].data) == T "Longitud inconsistente en $i: $(length(xb[i].data)) vs T=$T"
+        X[i, :] = Int32.(vec(xb[i].data))
+    end
+
+    return TensorEngine.Tensor(X; requires_grad=false)
+end
+
+"""
+    stack_onehot_batch(yb::AbstractVector{<:TensorEngine.Tensor}) -> Tensor
+
+Apila etiquetas one-hot (cada elemento Tensor 1D de tamaño C)
+en un Tensor 2D (C, N). Mantiene el device y usa Float32.
+"""
+function stack_onehot_batch(yb::AbstractVector{<:TensorEngine.Tensor})
+    @assert !isempty(yb) "Batch vacío en stack_onehot_batch"
+    N = length(yb)
+    @assert ndims(yb[1].data) == 1 "Cada etiqueta debe ser 1D; got ndims=$(ndims(yb[1].data))"
+    C = length(yb[1].data)
+
+    is_on_gpu = yb[1].data isa CUDA.CuArray
+    Y = is_on_gpu ? CUDA.zeros(Float32, C, N) : Array{Float32}(undef, C, N)
+
+    @inbounds for i in 1:N
+        @assert ndims(yb[i].data) == 1 "Etiqueta $i no es 1D; ndims=$(ndims(yb[i].data))"
+        @assert length(yb[i].data) == C "Tamaño inconsistente en $i: $(length(yb[i].data)) vs C=$C"
+        Y[:, i] = Float32.(vec(yb[i].data))
+    end
+
+    return TensorEngine.Tensor(Y; requires_grad=false)
+end
 
 end # module

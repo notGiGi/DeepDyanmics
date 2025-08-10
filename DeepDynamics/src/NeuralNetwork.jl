@@ -9,6 +9,7 @@ import NNlib: conv
 using CUDA.CUBLAS: gemm!
 using CUDA
 using LinearAlgebra
+using Statistics
 using ..ReshapeModule: Reshape  # Importar Reshape desde ReshapeModule
 using ..ConvKernelLayers
 export Sequential, Dense, Activation, collect_parameters,
@@ -356,6 +357,13 @@ function collect_layer_parameters(layer)
         for p in (layer.gamma, layer.beta)
             push!(params, p isa Tensor ? p : Tensor(p; requires_grad=true))
         end
+    elseif layer isa Layers.RNNCell
+        push!(params, layer.W_ih)
+        push!(params, layer.W_hh)
+        layer.b_ih !== nothing && push!(params, layer.b_ih)
+        layer.b_hh !== nothing && push!(params, layer.b_hh)
+    elseif layer isa Layers.RNN
+        append!(params, collect_layer_parameters(layer.cell))
     elseif layer isa ConvolutionalLayers.Conv2D
         for p in (layer.weights, layer.bias)
             push!(params, p isa Tensor ? p : Tensor(p; requires_grad=true))
@@ -479,6 +487,32 @@ function layer_to_device(layer, device::Symbol)
     return layer
 end
 
+
+function layer_to_device(layer::Layers.RNNCell, device::Symbol)
+    cell_new = Layers.RNNCell(layer.input_size, layer.hidden_size;
+                              bias=(layer.b_ih !== nothing),
+                              activation=layer.activation)
+    
+    cell_new.W_ih = TensorEngine.ensure_on_device(layer.W_ih, device)
+    cell_new.W_hh = TensorEngine.ensure_on_device(layer.W_hh, device)
+    cell_new.b_ih = layer.b_ih !== nothing ? 
+                    TensorEngine.ensure_on_device(layer.b_ih, device) : nothing
+    cell_new.b_hh = layer.b_hh !== nothing ? 
+                    TensorEngine.ensure_on_device(layer.b_hh, device) : nothing
+    cell_new.training = layer.training
+    
+    return cell_new
+end
+
+function layer_to_device(layer::Layers.RNN, device::Symbol)
+    cell_new = layer_to_device(layer.cell, device)
+    rnn_new = Layers.RNN(cell_new.input_size, cell_new.hidden_size;
+                         batch_first=layer.batch_first,
+                         return_sequences=layer.return_sequences)
+    rnn_new.cell = cell_new
+    return rnn_new
+end
+
 """
     forward(layer::DropoutLayer, input::TensorEngine.Tensor)
 
@@ -570,5 +604,19 @@ end
 function forward(layer::Layers.LayerNorm, input::Tensor)
     return Layers.forward(layer, input)
 end
+
+function forward(layer::Layers.RNNCell, input::Tensor, hidden=nothing)
+    return Layers.forward(layer, input, hidden)
+end
+
+function forward(layer::Layers.RNN, input::Tensor, h0=nothing)
+    return Layers.forward(layer, input, h0)
+end
+
+
+function forward(layer::EmbeddingLayer.Embedding, x::TensorEngine.Tensor)
+    return EmbeddingLayer.forward(layer, x)  # delega al forward bueno del módulo EmbeddingLayer
+end
+
 
 end # module NeuralNetwork

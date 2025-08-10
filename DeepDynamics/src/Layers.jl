@@ -2,7 +2,7 @@ module Layers
 
 using NNlib, CUDA, ..TensorEngine, ..AbstractLayer, ..ConvKernelLayers, Statistics, ..ConvolutionalLayers
 export BatchNorm, Flatten, LayerActivation, set_training!, reset_running_stats!, GlobalAvgPool, ResidualBlock, create_residual_block, CustomFlatten, DropoutLayer,
-       LayerNorm
+       LayerNorm, RNNCell, RNN
 
 
 # ==================================================================
@@ -573,130 +573,91 @@ struct Flatten <: AbstractLayer.Layer end
 # Reemplazar la función (layer::Flatten) completa con esta versión que incluye el caso 2D:
 
 function (layer::Flatten)(input::TensorEngine.Tensor)
-    dims = size(input.data)
-    @assert length(dims) >= 2 "El tensor de entrada debe tener al menos 2 dimensiones."
-    
-    is_on_gpu = (input.data isa CUDA.CuArray)
-    
-    # NUEVO: Caso para tensores 2D (como salida de embeddings)
-    if length(dims) == 2
-        # Para embeddings: (embedding_dim, seq_length) -> (embedding_dim * seq_length, 1)
-        flat_size = prod(dims)
-        if is_on_gpu
-            new_data = CUDA.reshape(input.data, (flat_size, 1))
-        else
-            new_data = reshape(input.data, (flat_size, 1))
-        end
-        
-        out = TensorEngine.Tensor(new_data; requires_grad=input.requires_grad)
-        
+    A   = input.data
+    nd  = ndims(A)
+    dev_gpu = A isa CUDA.CuArray
+
+    # 1) 1D -> (D,1)
+    if nd == 1
+        out_data = reshape(A, (length(A), 1))
+        out = TensorEngine.Tensor(out_data; requires_grad=input.requires_grad)
         if out.requires_grad
-            out.backward_fn = grad -> begin
-                grad_data = grad isa TensorEngine.Tensor ? grad.data : grad
-                
-                # Convertir a mismo dispositivo si es necesario
-                if is_on_gpu && !(grad_data isa CUDA.CuArray)
-                    grad_data = CUDA.CuArray(grad_data)
-                elseif !is_on_gpu && (grad_data isa CUDA.CuArray)
-                    grad_data = Array(grad_data)
-                end
-                
-                # Restaurar a forma original
-                restored = reshape(grad_data, dims)
-                TensorEngine.backward(input, TensorEngine.Tensor(restored))
+            out.backward_fn = g -> begin
+                G = g isa TensorEngine.Tensor ? g.data : g           # (D,1)
+                gx = reshape(G, (length(A),))
+                TensorEngine.backward(input, TensorEngine.Tensor(gx))
             end
         end
-        
         return out
     end
-    
-    # Caso específico para salida de GlobalAvgPool (batch, channels, 1, 1)
-    if length(dims) == 4 && dims[3] == 1 && dims[4] == 1
-        batch_size = dims[1]
-        channels = dims[2]
-        
-        if is_on_gpu
-            reshaped = CUDA.reshape(input.data, (batch_size, channels))
-            new_data = CUDA.permutedims(reshaped, (2, 1))
-        else
-            reshaped = reshape(input.data, (batch_size, channels))
-            new_data = permutedims(reshaped, (2, 1))
+
+    # 2) 2D -> identidad (D,N)
+    if nd == 2
+        out = TensorEngine.Tensor(A; requires_grad=input.requires_grad)
+        if out.requires_grad
+            out.backward_fn = g -> TensorEngine.backward(input, g isa TensorEngine.Tensor ? g : TensorEngine.Tensor(g))
         end
-    else
-        # Detectar el formato NCHW vs WHCN para otros casos
-        is_nchw = (length(dims) == 4 && dims[1] <= 64)
-        
-        if is_nchw
-            n = dims[1]
-            flat_dim = prod(dims[2:end])
-            
-            if is_on_gpu
-                reshaped = CUDA.reshape(input.data, (n, flat_dim))
-                new_data = CUDA.permutedims(reshaped, (2, 1))
-            else
-                reshaped = reshape(input.data, (n, flat_dim))
-                new_data = permutedims(reshaped, (2, 1))
+        return out
+    end
+
+    # 3) 3D -> caso secuencias (T,N,E) => (E*T, N)   *** Embedding nuevo ***
+    if nd == 3
+        T, N, E = size(A)
+        # (T,N,E) -> (E,T,N)
+        Ap = permutedims(A, (3, 1, 2))
+        # (E,T,N) -> (E*T, N)
+        out_data = reshape(Ap, (E*T, N))
+        out = TensorEngine.Tensor(out_data; requires_grad=input.requires_grad)
+
+        if out.requires_grad
+            out.backward_fn = g -> begin
+                G  = g isa TensorEngine.Tensor ? g.data : g          # (E*T, N)
+                G3 = reshape(G, (E, T, N))                           # (E,T,N)
+                Gorig = permutedims(G3, (2, 3, 1))                   # (T,N,E)
+                TensorEngine.backward(input, TensorEngine.Tensor(Gorig))
             end
-        else
-            flat_dim = prod(dims[1:end-1])
-            batch_dim = dims[end]
-            
-            if is_on_gpu
-                new_data = CUDA.reshape(input.data, (flat_dim, batch_dim))
-            else
-                new_data = reshape(input.data, (flat_dim, batch_dim))
+        end
+        return out
+    end
+
+    # 4) ≥4D: soportar NCHW típico y GAP (N,C,1,1) preservando batch
+    dims = size(A)
+
+    # (N,C,1,1) → (C,N)
+    if nd == 4 && dims[3] == 1 && dims[4] == 1
+        N, C = dims[1], dims[2]
+        resh = reshape(A, (N, C))
+        out_data = permutedims(resh, (2, 1))                          # (C,N)
+        out = TensorEngine.Tensor(out_data; requires_grad=input.requires_grad)
+        if out.requires_grad
+            out.backward_fn = g -> begin
+                G = g isa TensorEngine.Tensor ? g.data : g            # (C,N)
+                Gr = permutedims(G, (2, 1))                           # (N,C)
+                G4 = reshape(Gr, (N, C, 1, 1))
+                TensorEngine.backward(input, TensorEngine.Tensor(G4))
             end
+        end
+        return out
+    end
+
+    # Fallback ≥4D: asumir batch en primer eje (N, ...) → (prod(resto), N)
+    N = dims[1]
+    feat = Int(prod(dims[2:end]))
+    resh = reshape(A, (N, feat))                                      # (N,feat)
+    out_data = permutedims(resh, (2, 1))                               # (feat,N)
+    out = TensorEngine.Tensor(out_data; requires_grad=input.requires_grad)
+
+    if out.requires_grad
+        out.backward_fn = g -> begin
+            G = g isa TensorEngine.Tensor ? g.data : g                # (feat,N)
+            Gr = permutedims(G, (2, 1))                               # (N,feat)
+            Gorig = reshape(Gr, dims)
+            TensorEngine.backward(input, TensorEngine.Tensor(Gorig))
         end
     end
-    
-    out = TensorEngine.Tensor(new_data; requires_grad=input.requires_grad)
-    
-    # Backward para casos 4D
-    if out.requires_grad && length(dims) >= 4
-        out.backward_fn = grad -> begin
-            grad_data = grad
-            
-            if (grad_data isa CUDA.CuArray) != is_on_gpu
-                if is_on_gpu
-                    grad_data = CUDA.CuArray(grad_data)
-                else
-                    grad_data = Array(grad_data)
-                end
-            end
-            
-            if length(dims) == 4 && dims[3] == 1 && dims[4] == 1
-                batch_size = dims[1]
-                channels = dims[2]
-                
-                if is_on_gpu
-                    grad_reshaped = CUDA.permutedims(grad_data, (2, 1))
-                    restored = CUDA.reshape(grad_reshaped, (batch_size, channels, 1, 1))
-                else
-                    grad_reshaped = permutedims(grad_data, (2, 1))
-                    restored = reshape(grad_reshaped, (batch_size, channels, 1, 1))
-                end
-            elseif is_nchw
-                if is_on_gpu
-                    grad_reshaped = CUDA.permutedims(grad_data, (2, 1))
-                    restored = CUDA.reshape(grad_reshaped, dims)
-                else
-                    grad_reshaped = permutedims(grad_data, (2, 1))
-                    restored = reshape(grad_reshaped, dims)
-                end
-            else
-                if is_on_gpu
-                    restored = CUDA.reshape(grad_data, dims)
-                else
-                    restored = reshape(grad_data, dims)
-                end
-            end
-            
-            TensorEngine.backward(input, TensorEngine.Tensor(restored))
-        end
-    end
-    
     return out
 end
+
 
 # Función auxiliar para detectar formato
 function detect_format(dims::Tuple)
@@ -931,7 +892,18 @@ end
 function forward(ln::LayerNorm, x::TensorEngine.Tensor)
     x_shape = size(x.data)
     ndims_x = ndims(x.data)
-    
+    # --- Device guard: asegurar que gamma/beta están en el mismo dispositivo que x ---
+    is_x_gpu = x.data isa CUDA.CuArray
+    gamma_on_gpu = ln.gamma.data isa CUDA.CuArray
+    beta_on_gpu  = ln.beta.data  isa CUDA.CuArray
+
+    if is_x_gpu && (!gamma_on_gpu || !beta_on_gpu)
+        ln.gamma = TensorEngine.to_gpu(ln.gamma)
+        ln.beta  = TensorEngine.to_gpu(ln.beta)
+    elseif !is_x_gpu && (gamma_on_gpu || beta_on_gpu)
+        ln.gamma = TensorEngine.to_cpu(ln.gamma)
+        ln.beta  = TensorEngine.to_cpu(ln.beta)
+    end
     # Determinar dimensiones de normalización basado en el formato
     if ndims_x == 2  # Formato (features, batch)
         # Normalizar sobre features (dimensión 1)
@@ -1103,7 +1075,269 @@ function set_training!(ln::LayerNorm, mode::Bool)
     return ln
 end
 
+# ==================================================================
+# RNN - Recurrent Neural Network
+# (tu RNNCell queda igual; solo copio/pego para contexto)
+# ==================================================================
+mutable struct RNNCell <: AbstractLayer.Layer
+    input_size::Int
+    hidden_size::Int
+    W_ih::TensorEngine.Tensor
+    W_hh::TensorEngine.Tensor
+    b_ih::Union{TensorEngine.Tensor, Nothing}
+    b_hh::Union{TensorEngine.Tensor, Nothing}
+    activation::Function
+    training::Bool
+end
 
+function RNNCell(input_size::Int, hidden_size::Int;
+                 bias::Bool=true, activation::Function=tanh,
+                 requires_grad::Bool=true)
+    σ = sqrt(2f0 / (input_size + hidden_size))
+
+    W_ih = TensorEngine.Tensor(randn(Float32, hidden_size, input_size) .* σ;
+                               requires_grad=requires_grad)
+    W_hh = TensorEngine.Tensor(randn(Float32, hidden_size, hidden_size) .* σ;
+                               requires_grad=requires_grad)
+
+    b_ih = bias ? TensorEngine.Tensor(zeros(Float32, hidden_size, 1);
+                                      requires_grad=requires_grad) : nothing
+    b_hh = bias ? TensorEngine.Tensor(zeros(Float32, hidden_size, 1);
+                                      requires_grad=requires_grad) : nothing
+
+    return RNNCell(input_size, hidden_size, W_ih, W_hh, b_ih, b_hh, activation, true)
+end
+
+function forward(cell::RNNCell, input::TensorEngine.Tensor,
+                 hidden::Union{TensorEngine.Tensor, Nothing}=nothing)
+    batch_size = size(input.data, 2)
+    device = TensorEngine.device_of(input)
+
+    if hidden === nothing
+        h_data = zeros(Float32, cell.hidden_size, batch_size)
+        h_data = device == :gpu ? CUDA.cu(h_data) : h_data
+        hidden = TensorEngine.Tensor(h_data; requires_grad=false)
+    end
+
+    W_ih_data = TensorEngine.ensure_on_device(cell.W_ih.data, device)
+    W_hh_data = TensorEngine.ensure_on_device(cell.W_hh.data, device)
+    h = hidden.data
+    x = input.data
+
+    output = W_ih_data * x + W_hh_data * h
+
+    if cell.b_ih !== nothing
+        b_ih_data = TensorEngine.ensure_on_device(cell.b_ih.data, device)
+        output = output .+ b_ih_data
+    end
+    if cell.b_hh !== nothing
+        b_hh_data = TensorEngine.ensure_on_device(cell.b_hh.data, device)
+        output = output .+ b_hh_data
+    end
+
+    pre_activation = copy(output)
+
+    if cell.activation == tanh
+        output = tanh.(output)
+        activation_grad_fn = grad -> grad .* (1f0 .- output.^2)
+    elseif cell.activation == relu
+        output = max.(output, 0f0)
+        activation_grad_fn = grad -> grad .* (pre_activation .> 0f0)
+    elseif cell.activation == sigmoid
+        output = 1f0 ./ (1f0 .+ exp.(-output))
+        activation_grad_fn = grad -> grad .* output .* (1f0 .- output)
+    else
+        output = cell.activation(output)
+        activation_grad_fn = grad -> grad
+    end
+
+    h_new = TensorEngine.Tensor(output;
+                                requires_grad=input.requires_grad || cell.W_ih.requires_grad)
+
+    if h_new.requires_grad
+        h_new.backward_fn = function(grad)
+            grad_data = grad isa TensorEngine.Tensor ? grad.data : grad
+            grad_act = activation_grad_fn(grad_data)
+
+            ∇W_ih = grad_act * x'
+            ∇W_hh = grad_act * h'
+
+            if cell.b_ih !== nothing && cell.b_ih.requires_grad
+                ∇b_ih = sum(grad_act, dims=2)
+                TensorEngine.backward(cell.b_ih, TensorEngine.Tensor(∇b_ih; requires_grad=false))
+            end
+            if cell.b_hh !== nothing && cell.b_hh.requires_grad
+                ∇b_hh = sum(grad_act, dims=2)
+                TensorEngine.backward(cell.b_hh, TensorEngine.Tensor(∇b_hh; requires_grad=false))
+            end
+
+            ∇x = W_ih_data' * grad_act
+            ∇h = W_hh_data' * grad_act
+
+            if cell.W_ih.requires_grad
+                TensorEngine.backward(cell.W_ih, TensorEngine.Tensor(∇W_ih; requires_grad=false))
+            end
+            if cell.W_hh.requires_grad
+                TensorEngine.backward(cell.W_hh, TensorEngine.Tensor(∇W_hh; requires_grad=false))
+            end
+            if input.requires_grad
+                TensorEngine.backward(input, TensorEngine.Tensor(∇x; requires_grad=false))
+            end
+            if hidden.requires_grad
+                TensorEngine.backward(hidden, TensorEngine.Tensor(∇h; requires_grad=false))
+            end
+        end
+    end
+
+    return h_new
+end
+
+# ------------------------------------------------------------------
+
+mutable struct RNN <: AbstractLayer.Layer
+    cell::RNNCell
+    batch_first::Bool
+    return_sequences::Bool
+end
+
+function RNN(input_size::Int, hidden_size::Int;
+             batch_first::Bool=true,
+             return_sequences::Bool=true,
+             bias::Bool=true,
+             activation::Function=tanh,
+             requires_grad::Bool=true)
+    cell = RNNCell(input_size, hidden_size; bias=bias,
+                   activation=activation, requires_grad=requires_grad)
+    return RNN(cell, batch_first, return_sequences)
+end
+
+# =======================
+#  RNN FORWARD (arreglado)
+# =======================
+function forward(rnn::RNN, x::TensorEngine.Tensor,
+                 h0::Union{TensorEngine.Tensor, Nothing}=nothing)
+
+    # ---- 1) Normalización de entrada (tu lógica) ----
+    if ndims(x.data) == 2
+        N, flat_dim = size(x.data)
+        if flat_dim == rnn.cell.input_size
+            x = TensorEngine.Tensor(reshape(x.data, (N, 1, flat_dim));
+                                    requires_grad=x.requires_grad)
+        else
+            if rnn.batch_first
+                T = Int(flat_dim ÷ rnn.cell.input_size)
+                D = rnn.cell.input_size
+                x = TensorEngine.Tensor(reshape(x.data, (N, T, D));
+                                        requires_grad=x.requires_grad)
+            else
+                T = Int(flat_dim ÷ rnn.cell.input_size)
+                D = rnn.cell.input_size
+                x = TensorEngine.Tensor(reshape(x.data, (T, N, D));
+                                        requires_grad=x.requires_grad)
+            end
+        end
+    end
+
+    # ---- 2) Reordenamiento si batch_first ----
+    x_data = rnn.batch_first ? permutedims(x.data, (2, 1, 3)) : x.data  # (T,N,D)
+    T, N, D = size(x_data)
+    H = rnn.cell.hidden_size
+    device = TensorEngine.device_of(x)
+
+    # ---- 3) h0 ----
+    if h0 === nothing
+        h_data = zeros(Float32, H, N)
+        h_data = device == :gpu ? CUDA.cu(h_data) : h_data
+        h0 = TensorEngine.Tensor(h_data; requires_grad=false)
+    end
+
+    # ---- 4) Loop temporal con PUENTE DE GRADIENTE x_t → x ----
+    outputs = TensorEngine.Tensor[]
+    hidden  = h0
+
+    for t in 1:T
+        # x_data[t, :, :] es (N, D)  → necesitamos (D, N)
+        # Usar `view` (función), no `@view` (macro), para evitar el error de precompilación.
+        x_slice  = view(x_data, t, :, :)                 # (N, D) en el mismo device
+        x_t_data = permutedims(x_slice, (2, 1))          # (D, N)
+        x_t = TensorEngine.Tensor(x_t_data; requires_grad=x.requires_grad)
+
+        # *** PUENTE CRÍTICO DE GRADIENTE ***
+        if x.requires_grad
+            let t_local = t, T_local = T, N_local = N, D_local = D,
+                batch_first_local = rnn.batch_first, device_local = device, x_ref = x
+
+                x_t.backward_fn = function(g)
+                    gdata = g isa TensorEngine.Tensor ? g.data : g   # (D,N)
+                    gNxD  = permutedims(gdata, (2, 1))               # (N,D)
+
+                    # Gradiente con la MISMA forma que x.data
+                    if batch_first_local
+                        # x: (N,T,D)
+                        dX_slice = device_local == :gpu ?
+                            CUDA.zeros(Float32, N_local, T_local, D_local) :
+                            zeros(Float32, N_local, T_local, D_local)
+                        @views dX_slice[:, t_local, :] .= gNxD
+                    else
+                        # x: (T,N,D)
+                        dX_slice = device_local == :gpu ?
+                            CUDA.zeros(Float32, T_local, N_local, D_local) :
+                            zeros(Float32, T_local, N_local, D_local)
+                        @views dX_slice[t_local, :, :] .= gNxD
+                    end
+
+                    TensorEngine.backward(x_ref, TensorEngine.Tensor(dX_slice; requires_grad=false))
+                end
+            end
+        end
+
+        hidden = forward(rnn.cell, x_t, hidden)
+        push!(outputs, hidden)
+    end
+
+
+
+
+    # ---- 5) Salida ----
+    if !rnn.return_sequences
+        # outputs[end] tiene (H,N). La cadena de RNNCell ya backpropaga a pasos previos.
+        return outputs[end]
+    end
+
+    # Stack en (T,N,H)
+    out_data = zeros(Float32, T, N, H)
+    out_data = device == :gpu ? CUDA.cu(out_data) : out_data
+    for t in 1:T
+        # outputs[t].data: (H,N) -> (N,H)
+        @views out_data[t, :, :] .= permutedims(outputs[t].data, (2,1))
+    end
+
+    # Ajuste batch_first
+    out_data = rnn.batch_first ? permutedims(out_data, (2, 1, 3)) : out_data  # (N,T,H) ó (T,N,H)
+    output = TensorEngine.Tensor(out_data; requires_grad=x.requires_grad)
+
+    # ---- 6) Backward de la secuencia completa (para return_sequences=true) ----
+    if output.requires_grad
+        output.backward_fn = function(grad)
+            g = grad isa TensorEngine.Tensor ? grad.data : grad
+            g_tnh = rnn.batch_first ? permutedims(g, (2, 1, 3)) : g  # (T,N,H)
+
+            for t in T:-1:1
+                # grad_t: (H,N)
+                grad_t = permutedims(@view(g_tnh[t, :, :]), (2,1))
+                TensorEngine.backward(outputs[t],
+                    TensorEngine.Tensor(grad_t; requires_grad=false))
+            end
+            # Nota: Los backward de cada cell → input activarán los
+            # backward_fn de x_t definidos arriba, que a su vez acumulan en x.
+        end
+    end
+
+    return output
+end
+
+# Hacer RNN callable
+(rnn::RNN)(input::TensorEngine.Tensor) = forward(rnn, input, nothing)
 
 
 

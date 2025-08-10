@@ -138,7 +138,7 @@ using .Visualizations
 using .ReshapeModule: Reshape
 using .Losses: binary_crossentropy, categorical_crossentropy,binary_crossentropy_with_logits
 using .Layers: BatchNorm, set_training!, reset_running_stats!, Flatten,
-               GlobalAvgPool, DropoutLayer, LayerActivation, LayerNorm
+               GlobalAvgPool, DropoutLayer, LayerActivation, LayerNorm, RNNCell, RNN
 using .ConvolutionalLayers: Conv2D, MaxPooling, Conv2DTranspose
 using .EmbeddingLayer: Embedding, embedding_forward
 using .NeuralNetwork: Sequential, Dense, Activation, collect_parameters,
@@ -162,7 +162,7 @@ using .DataAugmentation: apply_augmentation, augment_batch
 using .LRSchedulers: StepScheduler, CosineAnnealingScheduler, get_lr
 using .Models: create_resnet, create_simple_cnn
 using .GPUMemoryManager: get_tensor_buffer, check_and_clear_gpu_memory, release_tensor_buffer, clear_cache
-using .DataLoaders: DataLoader, optimized_data_loader,  cleanup_data_loader!
+using .DataLoaders: DataLoader, optimized_data_loader,  cleanup_data_loader!, stack_indices_batch, stack_onehot_batch
 using .Callbacks: AbstractCallback, EarlyStopping, ReduceLROnPlateau, ModelCheckpoint,
        PrintCallback, FinalReportCallback,
        on_epoch_begin, on_epoch_end, on_train_begin, on_train_end,
@@ -220,7 +220,7 @@ export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero
        sync_offline_runs, MLOpsConfig, safe_timestamp, ModelBundle, ModelRegistry, register_model, get_model, list_models,
        register_model, get_model, list_models, predict, predict_proba, predict_generator, PredictionPipeline,
        quantize_model, warmup_model, TensorPool, get_tensor_from_pool!,
-       return_to_pool!, LayerNorm,swish, mish
+       return_to_pool!, LayerNorm,swish, mish, RNNCell, RNN, stack_indices_batch, stack_onehot_batch
        
 
 end # module

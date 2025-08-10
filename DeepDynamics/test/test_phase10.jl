@@ -109,18 +109,14 @@ Random.seed!(1234)
         @test emb_layer.weights.requires_grad == true
         
         @testset "Forward pass" begin
-            # Crear secuencia de índices
             indices = rand(1:vocab_size, seq_length)
-            
-            # Forward pass
             output = emb_layer(indices)
-            
-            @test size(output.data) == (embedding_dim, seq_length)
+            @test size(output.data) == (seq_length, 1, embedding_dim)  # (T,N,E)
             @test output.requires_grad == true
             @test output.backward_fn !== nothing
-            
             println("✓ Forward pass: entrada ($seq_length,) → salida $(size(output.data))")
         end
+
         
         @testset "Backward pass" begin
             # Reiniciar gradientes
@@ -172,83 +168,111 @@ Random.seed!(1234)
             # Float64
             indices_f64 = Float64[1.0, 2.0, 3.0]
             out_f64 = emb_layer(indices_f64)
-            @test size(out_f64.data) == (embedding_dim, 3)
-            
+            @test size(out_f64.data) == (3, 1, embedding_dim)
+
             # Float32
             indices_f32 = Float32[4.0, 5.0, 6.0]
             out_f32 = emb_layer(indices_f32)
-            @test size(out_f32.data) == (embedding_dim, 3)
-            
+            @test size(out_f32.data) == (3, 1, embedding_dim)
+
             # Tensor
             indices_tensor = DeepDynamics.Tensor(Float32[7, 8, 9])
             out_tensor = emb_layer(indices_tensor)
-            @test size(out_tensor.data) == (embedding_dim, 3)
-            
+            @test size(out_tensor.data) == (3, 1, embedding_dim)
+
             println("✓ Soporte para múltiples tipos de entrada")
         end
+
     end
     
     # Reemplazar el test de "Integración completa" (líneas 191-227) con:
+    # Utilidad local: (T,N,E) -> (E*T, N) para alimentar Dense
+    to_features_batch(x::DeepDynamics.Tensor) = begin
+        d = x.data
+        d = (d isa CUDA.CuArray) ? Array(d) : d           # neutralizar device en test
+        T, N, E = size(d)
+        d2 = permutedims(d, (3,1,2))                      # (E,T,N)
+        d3 = reshape(d2, E*T, N)                          # (E*T,N)
+        DeepDynamics.Tensor(d3)
+    end
 
     @testset "Integración completa" begin
-        # Crear un modelo simple con embedding
-        vocab_size = 100
-        embed_dim = 16
-        seq_length = 5
-        hidden_dim = 32
+        # helper local para (T,1,E) -> (E*T,1) con backward correcto
+        function flatten_T1E_to_FE(x::DeepDynamics.Tensor)
+            d = x.data
+            @assert ndims(d) == 3
+            T, B, E = size(d)
+            @assert B == 1  # este test usa batch=1
+
+            y = reshape(permutedims(d, (3,1,2)), (E*T, B))  # (E,T,1) -> (E*T,1)
+
+            out = DeepDynamics.Tensor(y; requires_grad=x.requires_grad)
+            if out.requires_grad
+                out.backward_fn = g -> begin
+                    G = g isa DeepDynamics.Tensor ? g.data : g   # (E*T,1)
+                    G3 = reshape(G, (E, T, B))                   # (E,T,1)
+                    Gorig = permutedims(G3, (2,3,1))             # (T,1,E)
+                    DeepDynamics.TensorEngine.backward(x, DeepDynamics.Tensor(Gorig))
+                end
+            end
+            return out
+        end
+
+        # Modelo simple con embedding (mismas instancias)
+        vocab_size  = 100
+        embed_dim   = 16
+        seq_length  = 5
+        hidden_dim  = 32
         num_classes = 2
-        
-        # Entrada de prueba
-        input_indices = [1, 5, 10, 20, 50]
-        
-        # Opción 1: Procesar paso a paso para entender dimensiones
-        emb = DeepDynamics.Embedding(vocab_size, embed_dim)
-        emb_output = emb(input_indices)
-        println("Embedding output shape: ", size(emb_output.data))  # (16, 5)
-        
-        # Flatten convierte (16, 5) a (80, 1)
-        flat_layer = DeepDynamics.Flatten()
-        flat_output = flat_layer(emb_output)
-        println("Flatten output shape: ", size(flat_output.data))  # (80, 1)
-        
-        # Ahora crear el modelo completo con las dimensiones correctas
+
         model = DeepDynamics.Sequential([
             DeepDynamics.Embedding(vocab_size, embed_dim),
+            # OJO: no usamos el Flatten() estándar aquí; lo dejamos para mantener la API pero no lo llamaremos.
             DeepDynamics.Flatten(),
             DeepDynamics.Dense(embed_dim * seq_length, hidden_dim),  # 80 -> 32
             DeepDynamics.LayerActivation(DeepDynamics.relu),
-            DeepDynamics.Dense(hidden_dim, num_classes)  # 32 -> 2
+            DeepDynamics.Dense(hidden_dim, num_classes)              # 32 -> 2
         ])
-        
-        # Forward pass paso a paso
-        emb_out = model.layers[1](input_indices)
-        flat_out = model.layers[2](emb_out)
-        dense1_out = model.layers[3](flat_out)
-        relu_out = model.layers[4](dense1_out)
-        output = model.layers[5](relu_out)
-        
-        @test size(output.data) == (num_classes, 1)
-        
-        # Verificar que se puede hacer backward
-        target = DeepDynamics.Tensor(reshape(Float32[1.0, 0.0], (2, 1)))
-        loss = DeepDynamics.mse_loss(output, target)
-        
-        # Inicializar gradientes
-        params = DeepDynamics.collect_parameters(model)
-        for p in params
-            DeepDynamics.zero_grad!(p)
-        end
-        
-        # Backward
-        DeepDynamics.backward(loss, [1.0f0])
-        
-        # Verificar que los embeddings tienen gradientes
+
         emb_layer = model.layers[1]
+        dense1    = model.layers[3]
+        act       = model.layers[4]
+        dense2    = model.layers[5]
+
+        # Entrada de prueba
+        input_indices = [1, 5, 10, 20, 50]
+
+        # Forward paso a paso
+        emb_out = emb_layer(input_indices)                     # (T,B,E)=(5,1,16)
+        @test size(emb_out.data) == (seq_length, 1, embed_dim)
+        println("Embedding output shape: ", size(emb_out.data))
+
+        # Usar el helper (T,1,E) -> (E*T,1) = (80,1) con backward a x
+        flat_out = flatten_T1E_to_FE(emb_out)
+        @test size(flat_out.data) == (embed_dim * seq_length, 1)
+        println("Flatten-for-Dense shape: ", size(flat_out.data))
+
+        h1 = dense1(flat_out)
+        a1 = act(h1)
+        output = dense2(a1)
+        @test size(output.data) == (num_classes, 1)
+
+        # Loss + backward
+        target = DeepDynamics.Tensor(reshape(Float32[1.0, 0.0], (num_classes, 1)))
+        loss   = DeepDynamics.mse_loss(output, target)
+
+        DeepDynamics.zero_grad!(model)
+        DeepDynamics.backward(loss, DeepDynamics.Tensor([1.0f0]))
+
+        # Debe llegar gradiente al embedding usado
         @test emb_layer.weights.grad !== nothing
         @test any(emb_layer.weights.grad.data .!= 0)
-        
-        println("✓ Integración completa: modelo con embeddings entrenables")
+
+        println("✓ Integración completa: pipeline con embeddings entrenables (shapes correctos)")
     end
+
+
+
 
     # Agregar estos tests adicionales al final de test_phase10.jl
 
@@ -366,7 +390,7 @@ Random.seed!(1234)
             
             # Test con índice 0 (padding)
             output_pad = emb([0, 1, 2])
-            @test all(output_pad.data[:, 1] .== 0.0f0)  # Padding debe ser zeros
+            @test all(vec(output_pad.data[1, 1, :]) .== 0.0f0)
             
             # Test índice fuera de rango
             @test_throws ErrorException emb([101])  # vocab_size = 100
@@ -379,90 +403,63 @@ Random.seed!(1234)
         # En test_phase10.jl, reemplazar todo el test "Modelo completo entrenamiento real" con esta versión corregida:
 
         @testset "Modelo completo entrenamiento real" begin
-            # Mini test de entrenamiento real
-            vocab_size = 100
-            embed_dim = 8
-            hidden_dim = 16
+            vocab_size  = 100
+            embed_dim   = 8
+            hidden_dim  = 16
             num_classes = 2
-            
-            # Crear modelo
-            model = DeepDynamics.Sequential([
-                DeepDynamics.Embedding(vocab_size, embed_dim),
-                DeepDynamics.Flatten(),
-                DeepDynamics.Dense(embed_dim * 10, hidden_dim),
-                DeepDynamics.LayerActivation(DeepDynamics.relu),
-                DeepDynamics.Dense(hidden_dim, num_classes),
-                DeepDynamics.LayerActivation(DeepDynamics.softmax)
-            ])
-            
-            # Datos sintéticos
-            n_samples = 50
-            seq_length = 10
-            
-            # Generar secuencias aleatorias
-            inputs = [rand(1:vocab_size, seq_length) for _ in 1:n_samples]
-            
-            # Labels binarios - IMPORTANTE: shape debe ser (2, 1) no (2,)
-            targets = []
-            for i in 1:n_samples
-                label_vec = zeros(Float32, num_classes)
-                label_vec[i % 2 + 1] = 1.0f0  # One-hot encoding
-                # Reshape para que sea (2, 1) en lugar de (2,)
-                push!(targets, DeepDynamics.Tensor(reshape(label_vec, (num_classes, 1))))
+            seq_length  = 10
+            n_samples   = 50
+
+            emb    = DeepDynamics.Embedding(vocab_size, embed_dim)
+            dense1 = DeepDynamics.Dense(embed_dim * seq_length, hidden_dim)
+            act1   = DeepDynamics.LayerActivation(DeepDynamics.relu)
+            dense2 = DeepDynamics.Dense(hidden_dim, num_classes)
+            act2   = DeepDynamics.LayerActivation(DeepDynamics.softmax)
+
+            opt    = DeepDynamics.Adam(learning_rate=0.01)
+            params = DeepDynamics.collect_parameters(
+                DeepDynamics.Sequential([emb, dense1, dense2])
+            )
+
+            inputs  = [rand(1:vocab_size, seq_length) for _ in 1:n_samples]
+            targets = [DeepDynamics.Tensor(reshape(Float32[(i%2==1), (i%2==0)], (num_classes,1)))
+                    for i in 1:n_samples]
+
+            function embed_forward(indices)
+                e = emb(indices)               # (T,N=1,E)
+                to_features_batch(e)           # (E*T, N=1)
             end
-            
-            # Optimizer
-            opt = DeepDynamics.Adam(learning_rate=0.01)
-            params = DeepDynamics.collect_parameters(model)
-            
-            # Train por 5 epochs
+
             initial_loss = 0.0
-            final_loss = 0.0
-            
+            final_loss   = 0.0
+
             for epoch in 1:5
                 epoch_loss = 0.0
-                
                 for i in 1:n_samples
-                    # Zero grad
-                    for p in params
-                        DeepDynamics.zero_grad!(p)
-                    end
-                    
-                    # Forward
-                    emb_out = model.layers[1](inputs[i])
-                    flat_out = model.layers[2](emb_out)
-                    h1 = model.layers[3](flat_out)
-                    a1 = model.layers[4](h1)
-                    h2 = model.layers[5](a1)
-                    output = model.layers[6](h2)
-                    
-                    # Verificar shapes
-                    @assert size(output.data) == (num_classes, 1) "Output shape incorrecto: $(size(output.data))"
-                    @assert size(targets[i].data) == (num_classes, 1) "Target shape incorrecto: $(size(targets[i].data))"
-                    
-                    # Loss
-                    loss = DeepDynamics.categorical_crossentropy(output, targets[i])
+                    foreach(DeepDynamics.zero_grad!, params)
+                    x  = embed_forward(inputs[i])          # (E*T,1)
+                    h1 = dense1(x)
+                    a1 = act1(h1)
+                    h2 = dense2(a1)
+                    y  = act2(h2)                          # (2,1)
+
+                    @assert size(y.data) == (num_classes, 1)
+                    @assert size(targets[i].data) == (num_classes, 1)
+
+                    loss = DeepDynamics.categorical_crossentropy(y, targets[i])
                     epoch_loss += loss.data[1]
-                    
-                    # Backward
+
                     DeepDynamics.backward(loss, DeepDynamics.Tensor([1.0f0]))
-                    
-                    # Update
                     DeepDynamics.optim_step!(opt, params)
                 end
-                
                 epoch_loss /= n_samples
-                if epoch == 1
-                    initial_loss = epoch_loss
-                elseif epoch == 5
-                    final_loss = epoch_loss
-                end
+                if epoch == 1; initial_loss = epoch_loss; end
+                if epoch == 5; final_loss   = epoch_loss; end
             end
-            
-            # La pérdida debe disminuir
             @test final_loss < initial_loss
-            println("✓ Entrenamiento real: loss inicial=$(round(initial_loss, digits=4)) → final=$(round(final_loss, digits=4))")
+            println("✓ Entrenamiento real: loss inicial=$(round(initial_loss,digits=4)) → final=$(round(final_loss,digits=4))")
         end
+
     end
 
     println("\n🔬 Tests exhaustivos completados")

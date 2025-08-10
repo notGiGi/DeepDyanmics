@@ -9,7 +9,7 @@ using Dates
 using ..TensorEngine: Tensor
 using ..NeuralNetwork: Sequential, Dense, Conv2D, collect_parameters, relu, sigmoid, tanh_activation, softmax, Activation
 using ..ConvolutionalLayers: MaxPooling, Conv2DTranspose
-using ..Layers: BatchNorm, Flatten, DropoutLayer, GlobalAvgPool, LayerNorm
+using ..Layers: BatchNorm, Flatten, DropoutLayer, GlobalAvgPool, LayerNorm, RNN, RNNCell
 using ..Callbacks: AbstractCallback
  
 export plot_training_history, LivePlotter, plot_model_architecture, 
@@ -114,7 +114,9 @@ Visualiza el historial de entrenamiento con diseño profesional.
 function plot_training_history(history::Dict; figsize=(10, 6), save_path=nothing)
     setup_plot_theme()
     
-    has_val_loss = haskey(history, :val_loss) && !all(isnan.(history[:val_loss]))
+    has_val_loss = haskey(history, :val_loss) &&
+               history[:val_loss] !== nothing &&
+               !all(isnan.(history[:val_loss]))
     n_metrics = count(k -> k ∉ [:train_loss, :val_loss], keys(history))
     
     layout = n_metrics > 0 ? (1, 2) : (1, 1)
@@ -631,7 +633,25 @@ function extract_layer_info(model)
             info[:name] = "Dense($(in_features)→$(out_features))"
             info[:params] = length(layer.weights.data) + length(layer.biases.data)
             info[:output_shape] = (out_features,)
-            
+        elseif layer_type <: RNNCell
+            info[:type] = "RNNCell"
+            in_features  = layer.input_size
+            hidden       = layer.hidden_size
+            has_bias     = (layer.b_ih !== nothing)  # si hay b_ih asumimos b_hh también
+            info[:name]  = "RNNCell($(in_features)→$(hidden))"
+            info[:params] = in_features * hidden + hidden * hidden + (has_bias ? 2 * hidden : 0)
+            info[:output_shape] = nothing
+
+        elseif layer_type <: RNN
+            info[:type] = "RNN"
+            in_features  = layer.cell.input_size
+            hidden       = layer.cell.hidden_size
+            has_bias     = (layer.cell.b_ih !== nothing)
+            seqflag      = layer.return_sequences ? "seq" : "last"
+            info[:name]  = "RNN($(in_features)→$(hidden), $seqflag)"
+            info[:params] = in_features * hidden + hidden * hidden + (has_bias ? 2 * hidden : 0)
+            info[:output_shape] = nothing
+
         elseif layer_type <: Conv2D
             info[:type] = "Conv2D"
             out_channels = size(layer.weights.data, 1)
@@ -755,7 +775,9 @@ function get_layer_color(layer_type::String)
         "Activation" => :lightpink,
         "Flatten" => :wheat,
         "GlobalAvgPool" => :palegreen,
-        "Unknown" => :white
+        "Unknown" => :white,
+        "RNN"      => :lightsteelblue,
+        "RNNCell"  => :thistle,
     )
     
     return get(color_map, layer_type, :white)
