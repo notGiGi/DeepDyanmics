@@ -6,7 +6,7 @@ using LinearAlgebra
 # Assuming TensorEngine is imported or available in the parent module
 using ..TensorEngine
 
-export SGD, Adam, RMSProp, Adagrad, Nadam, step!
+export SGD, Adam, RMSProp, Adagrad, Nadam, step!, clip_gradients_norm!
 
 """
     create_zeros_like(tensor::Tensor)
@@ -196,6 +196,39 @@ function Nadam(;
     )
 end
 
+"""
+    clip_gradients_norm!(params, max_norm)
+    
+Gradient clipping por norma global.
+CRÍTICO para RNN, LSTM, GRU para prevenir exploding gradients.
+"""
+function clip_gradients_norm!(params::Vector{<:TensorEngine.Tensor}, max_norm::Float32=5.0f0)
+    total_norm = 0f0
+    
+    # Calcular norma L2 global
+    for p in params
+        if p.grad !== nothing
+            grad_data = p.grad.data
+            total_norm += sum(abs2, grad_data)
+        end
+    end
+    
+    total_norm = sqrt(total_norm)
+    
+    # Aplicar clipping si excede max_norm
+    if total_norm > max_norm
+        clip_coef = max_norm / (total_norm + 1f-6)
+        for p in params
+            if p.grad !== nothing
+                p.grad.data .*= clip_coef
+            end
+        end
+    end
+    
+    return total_norm
+end
+
+
 # ========== FASE 2: Optimizer Update Steps con mejoras ==========
 
 # ========== Optimizer Update Steps con sincronización automática de momentos ==========
@@ -217,7 +250,17 @@ function step!(optimizer::SGD, parameters::Vector{<:TensorEngine.Tensor})
 end
 
 # Adam
-function step!(optimizer::Adam, parameters::Vector{<:TensorEngine.Tensor})
+function step!(optimizer::Adam, parameters::Vector{<:TensorEngine.Tensor}; 
+               clip_norm::Union{Nothing,Float32}=nothing)
+    # Aplicar gradient clipping si se especifica
+    if clip_norm !== nothing
+        norm = clip_gradients_norm!(parameters, clip_norm)
+        if norm > clip_norm * 2
+            @warn "Gradient explosion detected: norm=$norm, clipped to $clip_norm"
+        end
+    end
+    
+    # CÓDIGO EXISTENTE DE ADAM (sin cambios)
     optimizer.t += 1
     bias_correction1 = 1.0f0 - optimizer.beta1^optimizer.t
     bias_correction2 = 1.0f0 - optimizer.beta2^optimizer.t

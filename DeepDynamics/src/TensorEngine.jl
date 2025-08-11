@@ -757,6 +757,31 @@ function mean(x::Tensor)
     return out
 end
 
+# En TensorEngine.jl
+import Base: sum
+
+function sum(x::Tensor)
+    s = sum(x.data)  # escalar Float32/F64
+
+    # Crear vector de longitud 1 en el mismo dispositivo que x
+    y_data = x.data isa CUDA.CuArray ? CUDA.fill(s, 1) : reshape([s], 1)
+    out = Tensor(y_data; requires_grad=x.requires_grad)
+
+    if x.requires_grad
+        out.backward_fn = function(grad)
+            # grad puede ser Tensor o array; evitar indexación escalar en GPU
+            g = grad isa Tensor ? grad.data : grad
+            g0 = (g isa AbstractArray) ? sum(g) : g  # ← sin g[1]; usa reducción
+            g0 = convert(eltype(x.data), g0)
+
+            dx = x.data isa CUDA.CuArray ? CUDA.fill(g0, size(x.data)) :
+                                           fill(g0, size(x.data))
+            TensorEngine.backward(x, Tensor(dx))
+        end
+    end
+
+    return out
+end
 
 
 end  # module TensorEngine

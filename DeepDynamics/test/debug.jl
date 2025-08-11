@@ -1,234 +1,91 @@
-############################
-# debug_rnn.jl  (copy/paste)
-############################
+module DeepDebug
+# Debug de shapes/layers para DeepDynamics (solo forward)
 
 using DeepDynamics
-using CUDA
-using Random, Statistics
-using DeepDynamics.TensorEngine
-# ------------ CONFIG -------------
-const USE_GPU = CUDA.functional()   # pon false para forzar CPU
-Random.seed!(42)
+const TE = DeepDynamics.TensorEngine
+const NN = DeepDynamics.NeuralNetwork
 
-to_dev(x)  = (USE_GPU && CUDA.functional()) ? to_gpu(x) : x
-dev_name() = (USE_GPU && CUDA.functional()) ? "GPU" : "CPU"
+# ------------------ helpers compactos ------------------
+safe_data(x) = x isa TE.Tensor ? x.data : x
+safe_size(x) = try size(safe_data(x)) catch; () end
+typename(x)  = x isa Type ? string(x) : string(typeof(x))
+shortshape(x)= try "(" * join(safe_size(x), ",") * ")" catch; "<no-size>" end
 
-# --------- helpers: CE desde logits + probs ---------
-function ce_from_logits(logits::Tensor, y_true::Tensor)
-    z = logits.data; t = y_true.data
-    on_gpu = (z isa CUDA.CuArray)
-    if on_gpu && !(t isa CUDA.CuArray); t = CUDA.CuArray(t)
-    elseif !on_gpu && (t isa CUDA.CuArray); t = Array(t)
+# chequeo rápido para RNN/LSTM/GRU
+function check_sequence_batch(X; name="X")
+    A = safe_data(X); nd = ndims(A)
+    if nd == 3
+        (F,B,T) = size(A)
+        println("[$name] 3D ok (F,B,T)=($F,$B,$T)")
+        return true
+    elseif nd == 4
+        (F,B,D3,D4) = size(A)
+        ok = (D3==1 || D4==1)
+        println("[$name] 4D (F,B,$D3,$D4)  ", ok ? "✓ singleton ok" : "✗ falta singleton")
+        return ok
+    else
+        println("[$name] ndims=$nd (esperado 3D o 4D con singleton)")
+        return false
     end
-    m = maximum(z; dims=1); if on_gpu && !(m isa CUDA.CuArray); m = CUDA.CuArray(m); end
-    zst = z .- m
-    expz = exp.(zst); sumexp = sum(expz; dims=1); logp = zst .- log.(sumexp)
-    B = Float32(size(z,2))
-    loss_val = sum(-sum(t .* logp; dims=1)) / B
-    result = Tensor(reshape([loss_val], (1,1)); requires_grad=true)
-    if logits.requires_grad
-        result.backward_fn = grad -> begin
-            gs = grad; gs isa Tensor && (gs = gs.data)
-            gs isa AbstractArray && (gs = gs[1]); gs = Float32(gs)
-            p = expz ./ sumexp
-            TensorEngine.backward(logits, Tensor((p .- t) .* (gs / B)))
+end
+
+# ------------------ trazador por capa ------------------
+"""
+    trace_forward(model::Sequential, x; stop_on_error=true)
+
+Imprime capa por capa: tipo, shape in -> out.
+Si hay error, muestra contexto y pistas típicas para RNN/LSTM/GRU.
+"""
+function trace_forward(model::DeepDynamics.Sequential, x; stop_on_error::Bool=true)
+    x_t = x isa TE.Tensor ? x : TE.Tensor(x)
+    println("—"^70)
+    println("TRACE model=Sequential[", length(model.layers), " layers]  input=", shortshape(x_t))
+    cur = x_t
+    for (i, layer) in enumerate(model.layers)
+        print(@sprintf("[%02d] %-24s  in=%-16s  ", i, typename(layer), shortshape(cur)))
+        try
+            out = NN.forward(layer, cur)
+            println("out=", shortshape(out))
+            cur = out
+        catch e
+            println("❌ ERROR")
+            println("\n>>> ERROR en capa [$i] ", typename(layer))
+            println("    input shape: ", shortshape(cur))
+            if e isa DimensionMismatch
+                println("    DimensionMismatch: ", e)
+                println("    Tip: RNN/LSTM/GRU en este repo esperan (F,B,T).")
+                println("         Si tienes (B,F,T) o (F,T,B), permuta ejes antes de la primera RNN.")
+                println("         Para 4D, aceptan (F,B,1,T) o (F,B,T,1) (una dim unitaria).")
+            elseif e isa MethodError
+                println("    MethodError: ", e)
+                println("    Tip: usa NN.forward(layer, x) (Sequential ya lo hace).")
+            else
+                println("    ", typeof(e), ": ", e)
+            end
+            # stack corto
+            bt = stacktrace(e)
+            println("    Stack (top 5):")
+            for (k, fr) in enumerate(bt[1:min(5,length(bt))])
+                println("      $k) ", fr)
+            end
+            stop_on_error && rethrow(e)
         end
     end
-    return result
+    println("—"^70)
+    return cur
 end
 
-logits_to_probs(A) = begin
-    m = maximum(A; dims=1)
-    expz = exp.(A .- m)
-    expz ./ sum(expz; dims=1)
+# ------------------ runner sencillo ------------------
+"""
+    run(model, X; name="X")
+
+Chequea dims para secuencias y ejecuta trace_forward (no lanza excepción).
+"""
+function run(model::DeepDynamics.Sequential, X; name::String="X")
+    println("== DeepDebug ==")
+    println("batch ", name, " shape: ", shortshape(X))
+    check_sequence_batch(X; name=name)
+    return trace_forward(model, X; stop_on_error=false)
 end
 
-# --------- helpers: one-hot ---------
-# (V,T,B): features=vocab, luego tiempo, luego batch
-function to_onehot_VTB(X::AbstractMatrix{<:Integer}, V::Int)
-    T, B = size(X)
-    OH = zeros(Float32, V, T, B)
-    @inbounds for b in 1:B, t in 1:T
-        OH[X[t,b], t, b] = 1f0
-    end
-    return OH
-end
-
-# (T,V,B): tiempo, vocab, batch
-function to_onehot_TVB(X::AbstractMatrix{<:Integer}, V::Int)
-    T, B = size(X)
-    OH = zeros(Float32, T, V, B)
-    @inbounds for b in 1:B, t in 1:T
-        OH[t, X[t,b], b] = 1f0
-    end
-    return OH
-end
-
-# --------- helper: imprimir grad por parámetro ---------
-function grad_summary(model; label="")
-    println("\n--- Grad summary $label ---")
-    ps = collect_parameters(model)
-    got = 0
-    for (i,p) in enumerate(ps)
-        g = p.grad
-        has = g !== nothing
-        got += has ? 1 : 0
-        sz  = size(p.data)
-        norm = has ? mean(abs.(g.data)) : NaN
-        println(rpad("  p[$i] size=$(sz)", 32), " grad? ", has, has ? "  mean|grad|=$(round(norm,digits=6))" : "")
-    end
-    println("  ==> Parámetros con grad: $got/$(length(ps))")
-    got
-end
-
-# --------- helper: labels one-hot (arma en CPU; luego a device) ---------
-function make_labels(C, B)
-    Y = zeros(Float32, C, B)
-    @inbounds for i in 1:B
-        Y[(i % C) + 1, i] = 1f0
-    end
-    to_dev(Tensor(Y))
-end
-
-# ======================================
-# TEST 1: softmax head (descarta que la cabeza corte grad)
-# ======================================
-function test_softmax_head(; B=16, inF=8, C=3)
-    println("\n[TEST 1 · softmax head · $(dev_name())]")
-
-    # A) Dense -> softmax -> CCE
-    modelA = Sequential([ Dense(inF, C), Activation(softmax) ])
-    USE_GPU && (modelA = model_to_gpu(modelA))
-    x = to_dev(Tensor(randn(Float32, inF, B); requires_grad=true))
-    y = make_labels(C, B)
-
-    ypred = forward(modelA, x)
-    lossA = categorical_crossentropy(ypred, y)
-    zero_grad!(modelA); seed = to_dev(Tensor(ones(Float32,1,1)))
-    backward(lossA, seed)
-    gA = grad_summary(modelA; label="Dense + softmax + CCE")
-    println(gA==0 ? "❌ NO llegan gradientes por softmax" : "✅ Gradientes atraviesan softmax head.")
-
-    # B) Dense (logits) -> CE-from-logits
-    modelB = Sequential([ Dense(inF, C) ])
-    USE_GPU && (modelB = model_to_gpu(modelB))
-    ypredB = forward(modelB, x)
-    lossB  = ce_from_logits(ypredB, y)
-    zero_grad!(modelB); backward(lossB, seed)
-    gB = grad_summary(modelB; label="Dense (logits) + CE-from-logits")
-
-    println((gB>0 && gA==0) ? "➡️  Cambia a 'logits + CE-from-logits' en tu script." :
-                              "➡️  Softmax head OK (o ambos OK).")
-end
-
-# ======================================
-# TEST 2: Embedding en GPU (ver si corta grad)
-# ======================================
-function test_embedding_chain(; V=10, E=16, H=32, T=5, B=16, C=3)
-    println("\n[TEST 2 · Embedding→RNN→Dense · $(dev_name())]")
-    model = Sequential([
-        Embedding(V, E),
-        RNN(E, H; batch_first=false, return_sequences=false, activation=tanh),
-        Dense(H, C)   # logits
-    ])
-    USE_GPU && (model = model_to_gpu(model))
-
-    X = reshape(Int32.(rand(1:V, T*B)), T, B)
-    y = make_labels(C, B)
-
-    x = to_dev(Tensor(X))      # Int32 (Embedding)
-    logits = forward(model, x)
-    loss   = ce_from_logits(logits, y)
-    zero_grad!(model); seed = to_dev(Tensor(ones(Float32,1,1)))
-    backward(loss, seed)
-
-    got = grad_summary(model; label="Embedding→RNN→Dense (logits)")
-    if USE_GPU && got < length(collect_parameters(model))
-        println("⚠️ Embedding NO recibe gradiente en GPU. Usa CPU o evita Embedding (TEST 3/4).")
-    else
-        println("✅ Gradientes completos a través de Embedding en $(dev_name()).")
-    end
-end
-
-# ======================================
-# TEST 3/4: sin Embedding (one-hot) → detectar layout correcto
-# Probar:
-#   3A) 3D (V,T,B)
-#   3B) 3D (T,V,B)
-#   4)  2D flatten (V*T, B)  ← suele funcionar con RNN que hace reshape interno
-# ======================================
-function test_onehot_variants(; V=10, H1=32, H2=32, T=5, B=16, C=3)
-    println("\n[TEST 3/4 · one-hot variantes · $(dev_name())]")
-
-    base_model() = Sequential([
-        RNN(V,  H1; batch_first=false, return_sequences=true,  activation=tanh),
-        RNN(H1, H2; batch_first=false, return_sequences=false, activation=tanh),
-        Dense(H2, C)  # logits
-    ])
-
-    X = reshape(Int32.(rand(1:V, T*B)), T, B)
-    y = make_labels(C, B)
-
-    # ---- 3A: VTB (V,T,B) ----
-    modelA = base_model(); USE_GPU && (modelA = model_to_gpu(modelA))
-    try
-        OH = to_onehot_VTB(X, V)                       # (V,T,B)
-        x  = to_dev(Tensor(OH))
-        println("   shape VTB: ", size(x.data))
-        logits = forward(modelA, x)
-        loss   = ce_from_logits(logits, y)
-        zero_grad!(modelA); seed = to_dev(Tensor(ones(Float32,1,1)))
-        backward(loss, seed)
-        gA = grad_summary(modelA; label="one-hot (V,T,B)")
-        println(gA>0 ? "✅ Gradientes con (V,T,B)." : "❌ Sin grad con (V,T,B).")
-    catch e
-        println("❌ (V,T,B) falló: ", sprint(showerror, e))
-    end
-
-    # ---- 3B: TVB (T,V,B) ----
-    modelB = base_model(); USE_GPU && (modelB = model_to_gpu(modelB))
-    try
-        OH = to_onehot_TVB(X, V)                       # (T,V,B)
-        x  = to_dev(Tensor(OH))
-        println("   shape TVB: ", size(x.data))
-        logits = forward(modelB, x)
-        loss   = ce_from_logits(logits, y)
-        zero_grad!(modelB); seed = to_dev(Tensor(ones(Float32,1,1)))
-        backward(loss, seed)
-        gB = grad_summary(modelB; label="one-hot (T,V,B)")
-        println(gB>0 ? "✅ Gradientes con (T,V,B)." : "❌ Sin grad con (T,V,B).")
-    catch e
-        println("❌ (T,V,B) falló: ", sprint(showerror, e))
-    end
-
-    # ---- 4: 2D flatten (V*T, B) ----
-    # Muchos RNN de librerías caseras aceptan 2D y hacen reshape interno a (inF, T, B).
-    modelC = base_model(); USE_GPU && (modelC = model_to_gpu(modelC))
-    try
-        OH = to_onehot_VTB(X, V)                       # (V,T,B)
-        X2D = reshape(OH, V*T, B)                      # (V*T, B)  ← clave
-        x  = to_dev(Tensor(X2D))
-        println("   shape flat2D: ", size(x.data))
-        logits = forward(modelC, x)
-        loss   = ce_from_logits(logits, y)
-        zero_grad!(modelC); seed = to_dev(Tensor(ones(Float32,1,1)))
-        backward(loss, seed)
-        gC = grad_summary(modelC; label="one-hot flatten (V*T, B)")
-        println(gC>0 ? "✅ Gradientes con flatten 2D (V*T, B)." : "❌ Sin grad con flatten 2D.")
-    catch e
-        println("❌ flatten 2D falló: ", sprint(showerror, e))
-    end
-
-    println("➡️  Usa el PRIMER layout que marque ✅ arriba (si VTB/TVB fallan, normalmente el flatten 2D pasa).")
-end
-
-# ======================================
-# RUN ALL
-# ======================================
-println("=== DEBUG HARNESS (", dev_name(), ") ===")
-@time begin
-    test_softmax_head()
-    test_embedding_chain()
-    test_onehot_variants()   # ← incluye 3A, 3B y 4
-end
-println("\nListo. Observa las líneas con ✅/⚠️/❌ para decidir input layout y si debes evitar Embedding en GPU.")
+end # module

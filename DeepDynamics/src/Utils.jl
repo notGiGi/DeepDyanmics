@@ -18,23 +18,23 @@ end
 Establece el modo training/eval para todas las capas del modelo.
 Función unificada definida solo en el módulo principal.
 """
+
 function set_training_mode!(model, training::Bool)
-    # Para modelos Sequential
     if isa(model, NeuralNetwork.Sequential)
         for layer in model.layers
             set_training_mode!(layer, training)
         end
-    # Para capas específicas con campo training
-    elseif isa(model, Layers.BatchNorm) || isa(model, Layers.DropoutLayer) || isa(model, Layers.LayerNorm)
+    elseif isa(model, Layers.BatchNorm) || isa(model, Layers.DropoutLayer) || 
+           isa(model, Layers.LayerNorm)
         model.training = training
-   
-    elseif isa(model, Layers.RNNCell)
+    elseif isa(model, Layers.RNNCell) || isa(model, Layers.LSTMCell) || 
+           isa(model, Layers.GRUCell)
         model.training = training
-    elseif isa(model, Layers.RNN)
+    elseif isa(model, Layers.RNN) || isa(model, Layers.LSTM) || 
+           isa(model, Layers.GRU)
         model.cell.training = training
-    
-    return model
     end
+    return model
 end
 
 end  # module Utils

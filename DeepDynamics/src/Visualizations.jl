@@ -652,6 +652,46 @@ function extract_layer_info(model)
             info[:params] = in_features * hidden + hidden * hidden + (has_bias ? 2 * hidden : 0)
             info[:output_shape] = nothing
 
+        elseif layer_type <: LSTMCell
+            info[:type] = "LSTMCell"
+            info[:name] = "LSTMCell($(layer.input_size)→$(layer.hidden_size))"
+            # 4 matrices W_i + 4 matrices W_h + 8 biases
+            info[:params] = 4 * (layer.input_size * layer.hidden_size + 
+                                layer.hidden_size * layer.hidden_size + 
+                                2 * layer.hidden_size)
+            info[:output_shape] = (layer.hidden_size,)
+
+        elseif layer_type <: LSTM
+            info[:type] = "LSTM"
+            seqflag = layer.return_sequences ? "seq" : "last"
+            info[:name] = "LSTM($(layer.cell.input_size)→$(layer.cell.hidden_size), $seqflag)"
+            info[:params] = 4 * (layer.cell.input_size * layer.cell.hidden_size + 
+                                layer.cell.hidden_size * layer.cell.hidden_size + 
+                                2 * layer.cell.hidden_size)
+            info[:output_shape] = layer.return_sequences ? 
+                                (layer.cell.hidden_size, :seq) : 
+                                (layer.cell.hidden_size,)
+
+        elseif layer_type <: GRUCell
+            info[:type] = "GRUCell"
+            info[:name] = "GRUCell($(layer.input_size)→$(layer.hidden_size))"
+            # 3 matrices W_i + 3 matrices W_h + 6 biases
+            info[:params] = 3 * (layer.input_size * layer.hidden_size + 
+                                layer.hidden_size * layer.hidden_size + 
+                                2 * layer.hidden_size)
+            info[:output_shape] = (layer.hidden_size,)
+
+        elseif layer_type <: GRU
+            info[:type] = "GRU"
+            seqflag = layer.return_sequences ? "seq" : "last"
+            info[:name] = "GRU($(layer.cell.input_size)→$(layer.cell.hidden_size), $seqflag)"
+            info[:params] = 3 * (layer.cell.input_size * layer.cell.hidden_size + 
+                                layer.cell.hidden_size * layer.cell.hidden_size + 
+                                2 * layer.cell.hidden_size)
+            info[:output_shape] = layer.return_sequences ? 
+                                (layer.cell.hidden_size, :seq) : 
+                                (layer.cell.hidden_size,)
+
         elseif layer_type <: Conv2D
             info[:type] = "Conv2D"
             out_channels = size(layer.weights.data, 1)
@@ -778,6 +818,10 @@ function get_layer_color(layer_type::String)
         "Unknown" => :white,
         "RNN"      => :lightsteelblue,
         "RNNCell"  => :thistle,
+        "LSTM" => :lightcyan,
+        "LSTMCell" => :paleturquoise,
+        "GRU" => :lavender,
+        "GRUCell" => :plum,
     )
     
     return get(color_map, layer_type, :white)

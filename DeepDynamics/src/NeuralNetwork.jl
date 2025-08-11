@@ -357,6 +357,28 @@ function collect_layer_parameters(layer)
         for p in (layer.gamma, layer.beta)
             push!(params, p isa Tensor ? p : Tensor(p; requires_grad=true))
         end
+
+    elseif layer isa Layers.LSTMCell
+        for field in [:W_ii, :W_if, :W_ig, :W_io, 
+                    :W_hi, :W_hf, :W_hg, :W_ho,
+                    :b_ii, :b_if, :b_ig, :b_io,
+                    :b_hi, :b_hf, :b_hg, :b_ho]
+            push!(params, getfield(layer, field))
+        end
+    elseif layer isa Layers.GRUCell
+        for field in [:W_ir, :W_iz, :W_in,
+                    :W_hr, :W_hz, :W_hn,
+                    :b_ir, :b_iz, :b_in,
+                    :b_hr, :b_hz, :b_hn]
+            push!(params, getfield(layer, field))
+        end
+    elseif layer isa Layers.LSTM
+        append!(params, collect_layer_parameters(layer.cell))
+    elseif layer isa Layers.GRU
+        append!(params, collect_layer_parameters(layer.cell))
+
+
+
     elseif layer isa Layers.RNNCell
         push!(params, layer.W_ih)
         push!(params, layer.W_hh)
@@ -421,6 +443,33 @@ function layer_to_device(layer::Layers.BatchNorm, device::Symbol)
     bn_new.running_var  .= layer.running_var
     bn_new.num_batches_tracked = layer.num_batches_tracked
     return bn_new
+end
+
+
+function layer_to_device(layer::Union{Layers.LSTMCell, Layers.GRUCell}, device::Symbol)
+
+    if layer isa Layers.LSTMCell
+        # Crear con constructor para obtener estructura correcta
+        new_layer = Layers.LSTMCell(layer.input_size, layer.hidden_size)
+        # Pero REEMPLAZAR todos los tensores con los originales movidos
+        for field in [:W_ii, :W_if, :W_ig, :W_io, :W_hi, :W_hf, :W_hg, :W_ho,
+                     :b_ii, :b_if, :b_ig, :b_io, :b_hi, :b_hf, :b_hg, :b_ho]
+            tensor = getfield(layer, field)
+            setfield!(new_layer, field, TensorEngine.ensure_on_device(tensor, device))
+        end
+        new_layer.training = layer.training
+        
+    else  # GRUCell
+        new_layer = Layers.GRUCell(layer.input_size, layer.hidden_size)
+        for field in [:W_ir, :W_iz, :W_in, :W_hr, :W_hz, :W_hn,
+                     :b_ir, :b_iz, :b_in, :b_hr, :b_hz, :b_hn]
+            tensor = getfield(layer, field)
+            setfield!(new_layer, field, TensorEngine.ensure_on_device(tensor, device))
+        end
+        new_layer.training = layer.training
+    end
+    
+    return new_layer
 end
 
 function layer_to_device(layer::ConvolutionalLayers.Conv2D, device::Symbol)
@@ -617,6 +666,56 @@ end
 function forward(layer::EmbeddingLayer.Embedding, x::TensorEngine.Tensor)
     return EmbeddingLayer.forward(layer, x)  # delega al forward bueno del módulo EmbeddingLayer
 end
+
+function forward(layer::Layers.LSTM, input::TensorEngine.Tensor, state=nothing)
+    return Layers.forward(layer, input, state)
+end
+
+function forward(layer::Layers.GRU, input::TensorEngine.Tensor, hidden=nothing)
+    return Layers.forward(layer, input, hidden)
+end
+
+function forward(cell::Layers.LSTMCell, input::TensorEngine.Tensor,
+                 state::Tuple{TensorEngine.Tensor, TensorEngine.Tensor})
+    return Layers.forward(cell, input, state)
+end
+
+function forward(cell::Layers.GRUCell, input::TensorEngine.Tensor, hidden::TensorEngine.Tensor)
+    return Layers.forward(cell, input, hidden)
+end
+
+
+function layer_to_device(layer::Layers.LSTM, device::Symbol)
+    return Layers.LSTM(layer_to_device(layer.cell, device), layer.return_sequences)
+end
+
+function layer_to_device(layer::Layers.GRU, device::Symbol)
+    return Layers.GRU(layer_to_device(layer.cell, device), layer.return_sequences)
+end
+
+function model_to_gpu(layer::Layers.LSTM)
+    return layer_to_device(layer, :gpu)
+end
+function model_to_gpu(layer::Layers.GRU)
+    return layer_to_device(layer, :gpu)
+end
+function model_to_cpu(layer::Layers.LSTM)
+    return layer_to_device(layer, :cpu)
+end
+function model_to_cpu(layer::Layers.GRU)
+    return layer_to_device(layer, :cpu)
+end
+
+"""
+    collect_parameters(layer::DeepDynamics.AbstractLayer.Layer) -> Vector{Tensor}
+
+Fallback para capas individuales. Reutiliza `collect_layer_parameters` para
+obtener todos los tensores entrenables de la capa.
+"""
+function collect_parameters(layer::AbstractLayer.Layer)
+    return collect_layer_parameters(layer)
+end
+
 
 
 end # module NeuralNetwork

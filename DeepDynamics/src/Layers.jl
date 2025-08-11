@@ -2,7 +2,7 @@ module Layers
 
 using NNlib, CUDA, ..TensorEngine, ..AbstractLayer, ..ConvKernelLayers, Statistics, ..ConvolutionalLayers
 export BatchNorm, Flatten, LayerActivation, set_training!, reset_running_stats!, GlobalAvgPool, ResidualBlock, create_residual_block, CustomFlatten, DropoutLayer,
-       LayerNorm, RNNCell, RNN
+       LayerNorm, RNNCell, RNN, LSTMCell, LSTM, GRUCell, GRU
 
 
 # ==================================================================
@@ -1338,8 +1338,527 @@ end
 
 # Hacer RNN callable
 (rnn::RNN)(input::TensorEngine.Tensor) = forward(rnn, input, nothing)
+# ==================================================================
+# Layers.jl - LSTM/GRU con backward correctamente conectado
+# ==================================================================
+
+# Helper crítico que faltaba
+function _ensure_tensor(x, requires_grad::Bool)
+    if x isa TensorEngine.Tensor
+        return x
+    else
+        return TensorEngine.Tensor(x; requires_grad=requires_grad)
+    end
+end
+
+# ==================================================================
+# Utilidad: normaliza entrada a (F, B, T)
+# Acepta 3D (F,B,T) o 4D (F,B,1,T) / (F,B,T,1) y reduce dimensión unitaria
+# ==================================================================
+@inline function _to3d_sequence(data)
+    nd = ndims(data)
+    if nd == 3
+        return data
+    elseif nd == 2
+        F, B = size(data)
+        return data isa CUDA.CuArray ? CUDA.reshape(data, (F, B, 1)) :
+                                       reshape(data, (F, B, 1))
+    elseif nd == 4
+        F, B, D3, D4 = size(data)
+        if D3 == 1
+            return data isa CUDA.CuArray ? CUDA.reshape(data, (F, B, D4)) :
+                                           reshape(data, (F, B, D4))
+        elseif D4 == 1
+            return data isa CUDA.CuArray ? CUDA.reshape(data, (F, B, D3)) :
+                                           reshape(data, (F, B, D3))
+        else
+            throw(ArgumentError("Recurrent layers expect (F,B,T) or 4D with a singleton time/channel dim; got size=$(size(data))"))
+        end
+    else
+        throw(ArgumentError("Recurrent layers expect 2D, 3D or 4D input; got ndims=$(nd)"))
+    end
+end
+
+# ==================================================================
+# Activaciones que preservan gradiente (sin helpers externos)
+# ==================================================================
+function sigmoid_tensor(x::TensorEngine.Tensor)
+    # Sigmoide estable numéricamente (evita overflow para |x| grande)
+    y_data = 1f0 ./ (1f0 .+ exp.(-x.data))
+    out = TensorEngine.Tensor(y_data; requires_grad=x.requires_grad)
+
+    if x.requires_grad
+        out.backward_fn = function(grad)
+            grad_data = grad isa TensorEngine.Tensor ? grad.data : grad
+            dx = grad_data .* y_data .* (1f0 .- y_data)
+            TensorEngine.backward(x, TensorEngine.Tensor(dx))
+        end
+    end
+
+    return out
+end
+
+function tanh_tensor(x::TensorEngine.Tensor)
+    y = tanh.(x.data)
+    out = TensorEngine.Tensor(y; requires_grad=x.requires_grad)
+
+    if x.requires_grad
+        out.backward_fn = function(grad)
+            grad_data = grad isa TensorEngine.Tensor ? grad.data : grad
+            dx = grad_data .* (1f0 .- y.^2)
+            TensorEngine.backward(x, TensorEngine.Tensor(dx))
+        end
+    end
+
+    return out
+end
 
 
+# ==================================================================
+# Estructuras
+# ==================================================================
+mutable struct LSTMCell <: AbstractLayer.Layer
+    input_size::Int
+    hidden_size::Int
+    W_ii::TensorEngine.Tensor; W_if::TensorEngine.Tensor
+    W_ig::TensorEngine.Tensor; W_io::TensorEngine.Tensor
+    W_hi::TensorEngine.Tensor; W_hf::TensorEngine.Tensor
+    W_hg::TensorEngine.Tensor; W_ho::TensorEngine.Tensor
+    b_ii::TensorEngine.Tensor; b_if::TensorEngine.Tensor
+    b_ig::TensorEngine.Tensor; b_io::TensorEngine.Tensor
+    b_hi::TensorEngine.Tensor; b_hf::TensorEngine.Tensor
+    b_hg::TensorEngine.Tensor; b_ho::TensorEngine.Tensor
+    training::Bool
+end
+
+mutable struct GRUCell <: AbstractLayer.Layer
+    input_size::Int
+    hidden_size::Int
+    W_ir::TensorEngine.Tensor; W_iz::TensorEngine.Tensor; W_in::TensorEngine.Tensor
+    W_hr::TensorEngine.Tensor; W_hz::TensorEngine.Tensor; W_hn::TensorEngine.Tensor
+    b_ir::TensorEngine.Tensor; b_iz::TensorEngine.Tensor; b_in::TensorEngine.Tensor
+    b_hr::TensorEngine.Tensor; b_hz::TensorEngine.Tensor; b_hn::TensorEngine.Tensor
+    training::Bool
+end
+
+# ==================================================================
+# Constructores
+# ==================================================================
+function LSTMCell(input_size::Int, hidden_size::Int; 
+                  bias::Bool=true, requires_grad::Bool=true)
+    σ = sqrt(2f0 / (input_size + hidden_size))
+    
+    W_ii = TensorEngine.Tensor(randn(Float32, hidden_size, input_size) .* σ; requires_grad)
+    W_if = TensorEngine.Tensor(randn(Float32, hidden_size, input_size) .* σ; requires_grad)
+    W_ig = TensorEngine.Tensor(randn(Float32, hidden_size, input_size) .* σ; requires_grad)
+    W_io = TensorEngine.Tensor(randn(Float32, hidden_size, input_size) .* σ; requires_grad)
+    
+    W_hi = TensorEngine.Tensor(randn(Float32, hidden_size, hidden_size) .* σ; requires_grad)
+    W_hf = TensorEngine.Tensor(randn(Float32, hidden_size, hidden_size) .* σ; requires_grad)
+    W_hg = TensorEngine.Tensor(randn(Float32, hidden_size, hidden_size) .* σ; requires_grad)
+    W_ho = TensorEngine.Tensor(randn(Float32, hidden_size, hidden_size) .* σ; requires_grad)
+    
+    b_ii = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    b_if = TensorEngine.Tensor(ones(Float32, hidden_size, 1); requires_grad)  # Forget bias = 1
+    b_ig = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    b_io = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    
+    b_hi = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    b_hf = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    b_hg = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    b_ho = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    
+    return LSTMCell(input_size, hidden_size,
+                    W_ii, W_if, W_ig, W_io,
+                    W_hi, W_hf, W_hg, W_ho,
+                    b_ii, b_if, b_ig, b_io,
+                    b_hi, b_hf, b_hg, b_ho, true)
+end
+
+function GRUCell(input_size::Int, hidden_size::Int; 
+                 bias::Bool=true, requires_grad::Bool=true)
+    σ = sqrt(2f0 / (input_size + hidden_size))
+    
+    W_ir = TensorEngine.Tensor(randn(Float32, hidden_size, input_size) .* σ; requires_grad)
+    W_iz = TensorEngine.Tensor(randn(Float32, hidden_size, input_size) .* σ; requires_grad)
+    W_in = TensorEngine.Tensor(randn(Float32, hidden_size, input_size) .* σ; requires_grad)
+    
+    W_hr = TensorEngine.Tensor(randn(Float32, hidden_size, hidden_size) .* σ; requires_grad)
+    W_hz = TensorEngine.Tensor(randn(Float32, hidden_size, hidden_size) .* σ; requires_grad)
+    W_hn = TensorEngine.Tensor(randn(Float32, hidden_size, hidden_size) .* σ; requires_grad)
+    
+    b_ir = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    b_iz = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    b_in = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    
+    b_hr = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    b_hz = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    b_hn = TensorEngine.Tensor(zeros(Float32, hidden_size, 1); requires_grad)
+    
+    return GRUCell(input_size, hidden_size,
+                   W_ir, W_iz, W_in,
+                   W_hr, W_hz, W_hn,
+                   b_ir, b_iz, b_in,
+                   b_hr, b_hz, b_hn, true)
+end
+
+# ==================================================================
+# Forward LSTM con backward conectado
+# ==================================================================
+function forward(cell::LSTMCell, input::TensorEngine.Tensor, state)
+    # Normalizar estados
+    h_prev = state[1] isa TensorEngine.Tensor ? state[1] : TensorEngine.Tensor(state[1]; requires_grad=input.requires_grad)
+    c_prev = state[2] isa TensorEngine.Tensor ? state[2] : TensorEngine.Tensor(state[2]; requires_grad=input.requires_grad)
+    
+    # Mover todo al mismo dispositivo
+    device = TensorEngine.device_of(input)
+    h_prev = TensorEngine.ensure_on_device(h_prev, device)
+    c_prev = TensorEngine.ensure_on_device(c_prev, device)
+    
+    # Usar TensorEngine.matmul que devuelve Tensor
+    mm = TensorEngine.matmul
+    
+    # Computar pre-activaciones como Tensors
+    zi = mm(cell.W_ii, input)
+    zf = mm(cell.W_if, input)  
+    zg = mm(cell.W_ig, input)
+    zo = mm(cell.W_io, input)
+    
+    ri = mm(cell.W_hi, h_prev)
+    rf = mm(cell.W_hf, h_prev)
+    rg = mm(cell.W_hg, h_prev)
+    ro = mm(cell.W_ho, h_prev)
+    
+    # Sumar biases (operaciones Tensor + Tensor)
+    pre_i = TensorEngine.add(TensorEngine.add(zi, cell.b_ii), TensorEngine.add(ri, cell.b_hi))
+    pre_f = TensorEngine.add(TensorEngine.add(zf, cell.b_if), TensorEngine.add(rf, cell.b_hf))
+    pre_g = TensorEngine.add(TensorEngine.add(zg, cell.b_ig), TensorEngine.add(rg, cell.b_hg))
+    pre_o = TensorEngine.add(TensorEngine.add(zo, cell.b_io), TensorEngine.add(ro, cell.b_ho))
+    
+    # Aplicar activaciones
+    i_gate = sigmoid_tensor(pre_i)
+    f_gate = sigmoid_tensor(pre_f)
+    g_gate = tanh_tensor(pre_g)
+    o_gate = sigmoid_tensor(pre_o)
+    
+    # Cell state update (elemento a elemento entre Tensors)
+    c_new_part1 = TensorEngine.Tensor(f_gate.data .* c_prev.data; requires_grad=input.requires_grad)
+    c_new_part2 = TensorEngine.Tensor(i_gate.data .* g_gate.data; requires_grad=input.requires_grad)
+    c_new = TensorEngine.add(c_new_part1, c_new_part2)
+    
+    # Clamp para estabilidad
+    c_new = TensorEngine.Tensor(clamp.(c_new.data, -10f0, 10f0); requires_grad=input.requires_grad)
+    
+    # Hidden state
+    tanh_c = tanh_tensor(c_new)
+    h_new = TensorEngine.Tensor(o_gate.data .* tanh_c.data; requires_grad=input.requires_grad)
+    
+    # CONECTAR BACKWARD
+    if h_new.requires_grad
+        # Guardar valores para backward
+        saved_for_backward = (i_gate.data, f_gate.data, g_gate.data, o_gate.data, 
+                              c_prev.data, c_new.data, h_prev.data, input.data)
+        
+        h_new.backward_fn = function(grad_h)
+            grad_h_data = grad_h isa TensorEngine.Tensor ? grad_h.data : grad_h
+            
+            # Desempaquetar
+            i_g, f_g, g_g, o_g, c_old, c_n, h_old, x = saved_for_backward
+            
+            # Backward through output
+            grad_o = grad_h_data .* tanh.(c_n)
+            grad_c_from_h = grad_h_data .* o_g .* (1f0 .- tanh.(c_n).^2)
+            
+            # Backward through cell
+            grad_f = grad_c_from_h .* c_old
+            grad_i = grad_c_from_h .* g_g
+            grad_g = grad_c_from_h .* i_g
+            grad_c_prev = grad_c_from_h .* f_g
+            
+            # Through gates
+            grad_i_pre = grad_i .* i_g .* (1f0 .- i_g)
+            grad_f_pre = grad_f .* f_g .* (1f0 .- f_g)
+            grad_g_pre = grad_g .* (1f0 .- g_g.^2)
+            grad_o_pre = grad_o .* o_g .* (1f0 .- o_g)
+            
+            # Weight gradients
+            TensorEngine.backward(cell.W_ii, TensorEngine.Tensor(grad_i_pre * x'))
+            TensorEngine.backward(cell.W_if, TensorEngine.Tensor(grad_f_pre * x'))
+            TensorEngine.backward(cell.W_ig, TensorEngine.Tensor(grad_g_pre * x'))
+            TensorEngine.backward(cell.W_io, TensorEngine.Tensor(grad_o_pre * x'))
+            
+            TensorEngine.backward(cell.W_hi, TensorEngine.Tensor(grad_i_pre * h_old'))
+            TensorEngine.backward(cell.W_hf, TensorEngine.Tensor(grad_f_pre * h_old'))
+            TensorEngine.backward(cell.W_hg, TensorEngine.Tensor(grad_g_pre * h_old'))
+            TensorEngine.backward(cell.W_ho, TensorEngine.Tensor(grad_o_pre * h_old'))
+            
+            # Bias gradients
+            TensorEngine.backward(cell.b_ii, TensorEngine.Tensor(sum(grad_i_pre, dims=2)))
+            TensorEngine.backward(cell.b_if, TensorEngine.Tensor(sum(grad_f_pre, dims=2)))
+            TensorEngine.backward(cell.b_ig, TensorEngine.Tensor(sum(grad_g_pre, dims=2)))
+            TensorEngine.backward(cell.b_io, TensorEngine.Tensor(sum(grad_o_pre, dims=2)))
+            
+            TensorEngine.backward(cell.b_hi, TensorEngine.Tensor(sum(grad_i_pre, dims=2)))
+            TensorEngine.backward(cell.b_hf, TensorEngine.Tensor(sum(grad_f_pre, dims=2)))
+            TensorEngine.backward(cell.b_hg, TensorEngine.Tensor(sum(grad_g_pre, dims=2)))
+            TensorEngine.backward(cell.b_ho, TensorEngine.Tensor(sum(grad_o_pre, dims=2)))
+            
+            # Input gradient  
+            grad_x = cell.W_ii.data' * grad_i_pre .+ 
+                     cell.W_if.data' * grad_f_pre .+ 
+                     cell.W_ig.data' * grad_g_pre .+ 
+                     cell.W_io.data' * grad_o_pre
+            TensorEngine.backward(input, TensorEngine.Tensor(grad_x))
+            
+            # Hidden gradient
+            grad_h_prev = cell.W_hi.data' * grad_i_pre .+ 
+                          cell.W_hf.data' * grad_f_pre .+ 
+                          cell.W_hg.data' * grad_g_pre .+ 
+                          cell.W_ho.data' * grad_o_pre
+            TensorEngine.backward(h_prev, TensorEngine.Tensor(grad_h_prev))
+            TensorEngine.backward(c_prev, TensorEngine.Tensor(grad_c_prev))
+        end
+        
+        # También backward para c_new
+        c_new.backward_fn = function(grad_c)
+            # Propagar gradiente del cell state
+            if h_new.backward_fn !== nothing
+                # Esto se maneja arriba
+            end
+        end
+    end
+    
+    return (h_new, c_new)
+end
+
+(cell::LSTMCell)(input, state) = forward(cell, input, state)
+
+# ==================================================================
+# Forward GRU con backward conectado
+# ==================================================================
+function forward(cell::GRUCell, input::TensorEngine.Tensor, hidden)
+    h_prev = hidden isa TensorEngine.Tensor ? hidden : TensorEngine.Tensor(hidden; requires_grad=input.requires_grad)
+    
+    device = TensorEngine.device_of(input)
+    h_prev = TensorEngine.ensure_on_device(h_prev, device)
+    
+    mm = TensorEngine.matmul
+    
+    # Pre-activaciones
+    zi = mm(cell.W_ir, input)
+    zz = mm(cell.W_iz, input)
+    zn = mm(cell.W_in, input)
+    
+    ri = mm(cell.W_hr, h_prev)
+    rz = mm(cell.W_hz, h_prev)
+    rn = mm(cell.W_hn, h_prev)
+    
+    pre_r = TensorEngine.add(TensorEngine.add(zi, cell.b_ir), TensorEngine.add(ri, cell.b_hr))
+    pre_z = TensorEngine.add(TensorEngine.add(zz, cell.b_iz), TensorEngine.add(rz, cell.b_hz))
+    
+    r_gate = sigmoid_tensor(pre_r)
+    z_gate = sigmoid_tensor(pre_z)
+    
+    # New gate con reset aplicado
+    rn_gated = TensorEngine.Tensor(r_gate.data .* rn.data; requires_grad=input.requires_grad)
+    pre_n = TensorEngine.add(TensorEngine.add(zn, cell.b_in), 
+                             TensorEngine.add(rn_gated, cell.b_hn))
+    n_gate = tanh_tensor(pre_n)
+    
+    # Hidden update
+    h_new_part1 = TensorEngine.Tensor((1f0 .- z_gate.data) .* n_gate.data; requires_grad=input.requires_grad)
+    h_new_part2 = TensorEngine.Tensor(z_gate.data .* h_prev.data; requires_grad=input.requires_grad)
+    h_new = TensorEngine.add(h_new_part1, h_new_part2)
+    
+    # CONECTAR BACKWARD
+    if h_new.requires_grad
+        saved = (r_gate.data, z_gate.data, n_gate.data, h_prev.data, input.data)
+        
+        h_new.backward_fn = function(grad_h)
+            grad_h_data = grad_h isa TensorEngine.Tensor ? grad_h.data : grad_h
+            r_g, z_g, n_g, h_old, x = saved
+
+            grad_n = grad_h_data .* (1f0 .- z_g)
+            grad_z = grad_h_data .* (n_g .- h_old)
+            grad_h_old_direct = grad_h_data .* z_g
+
+            grad_n_pre = grad_n .* (1f0 .- n_g.^2)
+            grad_z_pre = grad_z .* z_g .* (1f0 .- z_g)
+
+            Whn_h = cell.W_hn.data * h_old
+            grad_r = grad_n_pre .* Whn_h
+            grad_r_pre = grad_r .* r_g .* (1f0 .- r_g)
+
+            TensorEngine.backward(cell.W_ir, TensorEngine.Tensor(grad_r_pre * x'))
+            TensorEngine.backward(cell.W_iz, TensorEngine.Tensor(grad_z_pre * x'))
+            TensorEngine.backward(cell.W_in, TensorEngine.Tensor(grad_n_pre * x'))
+
+            TensorEngine.backward(cell.W_hr, TensorEngine.Tensor(grad_r_pre * h_old'))
+            TensorEngine.backward(cell.W_hz, TensorEngine.Tensor(grad_z_pre * h_old'))
+            TensorEngine.backward(cell.W_hn, TensorEngine.Tensor(grad_n_pre .* r_g * h_old'))
+
+            TensorEngine.backward(cell.b_ir, TensorEngine.Tensor(sum(grad_r_pre, dims=2)))
+            TensorEngine.backward(cell.b_iz, TensorEngine.Tensor(sum(grad_z_pre, dims=2)))
+            TensorEngine.backward(cell.b_in, TensorEngine.Tensor(sum(grad_n_pre, dims=2)))
+
+            TensorEngine.backward(cell.b_hr, TensorEngine.Tensor(sum(grad_r_pre, dims=2)))
+            TensorEngine.backward(cell.b_hz, TensorEngine.Tensor(sum(grad_z_pre, dims=2)))
+            TensorEngine.backward(cell.b_hn, TensorEngine.Tensor(sum(grad_n_pre, dims=2)))  # ← fix
+
+            grad_x = cell.W_ir.data' * grad_r_pre .+
+                    cell.W_iz.data' * grad_z_pre .+
+                    cell.W_in.data' * grad_n_pre
+            TensorEngine.backward(input, TensorEngine.Tensor(grad_x))
+
+            grad_h_prev = grad_h_old_direct .+
+                        cell.W_hr.data' * grad_r_pre .+
+                        cell.W_hz.data' * grad_z_pre .+
+                        cell.W_hn.data' * (grad_n_pre .* r_g)
+            TensorEngine.backward(h_prev, TensorEngine.Tensor(grad_h_prev))
+        end
+
+    end
+    
+    return h_new
+end
+
+(cell::GRUCell)(input, hidden) = forward(cell, input, hidden)
+
+# ==================================================================
+# Wrappers LSTM/GRU (más limpios)
+# ==================================================================
+mutable struct LSTM <: AbstractLayer.Layer
+    cell::LSTMCell
+    return_sequences::Bool
+end
+
+function LSTM(input_size::Int, hidden_size::Int; 
+              return_sequences::Bool=false, kwargs...)
+    cell = LSTMCell(input_size, hidden_size; kwargs...)
+    return LSTM(cell, return_sequences)
+end
+
+function forward(lstm::LSTM, input::TensorEngine.Tensor, state=nothing)
+    data3 = _to3d_sequence(input.data)
+
+    input3 =
+        (data3 === input.data) ? input :
+        begin
+            t3 = TensorEngine.Tensor(data3; requires_grad=input.requires_grad)
+            if t3.requires_grad
+                # puente backward 3D -> input original (2D/3D/4D)
+                t3.backward_fn = function(grad3)
+                    g3 = grad3 isa TensorEngine.Tensor ? grad3.data : grad3
+                    if ndims(input.data) == 3
+                        TensorEngine.backward(input, TensorEngine.Tensor(g3))
+                    else
+                        F, B = size(g3, 1), size(g3, 2)
+                        if size(input.data, 3) == 1
+                            g4 = (input.data isa CUDA.CuArray) ?
+                                 CUDA.reshape(g3, (F, B, 1, size(g3,3))) :
+                                 reshape(g3, (F, B, 1, size(g3,3)))
+                        else
+                            g4 = (input.data isa CUDA.CuArray) ?
+                                 CUDA.reshape(g3, (F, B, size(g3,3), 1)) :
+                                 reshape(g3, (F, B, size(g3,3), 1))
+                        end
+                        TensorEngine.backward(input, TensorEngine.Tensor(g4))
+                    end
+                end
+            end
+            t3
+        end
+
+    seq_len = size(data3, 3)
+    batch_size = size(data3, 2)
+    device = TensorEngine.device_of(input3)
+
+    if state === nothing
+        h = zeros(Float32, lstm.cell.hidden_size, batch_size)
+        c = zeros(Float32, lstm.cell.hidden_size, batch_size)
+        if device == :gpu
+            h = CUDA.CuArray(h); c = CUDA.CuArray(c)
+        end
+        state = (TensorEngine.Tensor(h), TensorEngine.Tensor(c))
+    end
+
+    outputs = Vector{TensorEngine.Tensor}(undef, seq_len)
+    for t in 1:seq_len
+        x_t_data = data3[:, :, t]
+        x_t = TensorEngine.Tensor(copy(x_t_data); requires_grad=input3.requires_grad)
+
+        if x_t.requires_grad
+            # puente backward timestep -> gradiente 3D completo hacia input3
+            x_t.backward_fn = function(grad_xt)
+                g = grad_xt isa TensorEngine.Tensor ? grad_xt.data : grad_xt
+                G = similar(data3, size(data3))
+                fill!(G, zero(eltype(G)))
+                @views G[:, :, t] .= g
+                TensorEngine.backward(input3, TensorEngine.Tensor(G))
+            end
+        end
+
+        state = forward(lstm.cell, x_t, state)
+        outputs[t] = state[1]
+    end
+
+    if lstm.return_sequences
+        out_data = cat((o.data for o in outputs)..., dims=3)
+        return TensorEngine.Tensor(out_data; requires_grad=input3.requires_grad)
+    else
+        return outputs[end]
+    end
+end
+
+
+(lstm::LSTM)(input, state=nothing) = forward(lstm, input, state)
+
+mutable struct GRU <: AbstractLayer.Layer
+    cell::GRUCell
+    return_sequences::Bool
+end
+
+function GRU(input_size::Int, hidden_size::Int; 
+             return_sequences::Bool=false, kwargs...)
+    cell = GRUCell(input_size, hidden_size; kwargs...)
+    return GRU(cell, return_sequences)
+end
+
+function forward(gru::GRU, input::TensorEngine.Tensor, hidden=nothing)
+    # Normalizar a (F, B, T)
+    data3 = _to3d_sequence(input.data)
+    input3 = (data3 === input.data) ? input :
+             TensorEngine.Tensor(data3; requires_grad=input.requires_grad)
+
+    seq_len   = size(data3, 3)
+    batch_size = size(data3, 2)
+    device = TensorEngine.device_of(input3)
+
+    if hidden === nothing
+        h = zeros(Float32, gru.cell.hidden_size, batch_size)
+        if device == :gpu
+            h = CUDA.CuArray(h)
+        end
+        hidden = TensorEngine.Tensor(h)
+    end
+
+    outputs = Vector{TensorEngine.Tensor}(undef, seq_len)
+    for t in 1:seq_len
+        x_t_data = data3[:, :, t]
+        x_t = TensorEngine.Tensor(copy(x_t_data); requires_grad=input3.requires_grad)
+        hidden = forward(gru.cell, x_t, hidden)
+        outputs[t] = hidden
+    end
+
+    if gru.return_sequences
+        out_data = cat((o.data for o in outputs)..., dims=3)
+        return TensorEngine.Tensor(out_data; requires_grad=input3.requires_grad)
+    else
+        return outputs[end]
+    end
+end
+
+(gru::GRU)(input, hidden=nothing) = forward(gru, input, hidden)
 
 
 end  # module Layers

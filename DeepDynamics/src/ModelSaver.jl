@@ -331,29 +331,26 @@ end
 # FUNCIÓN CORREGIDA con inspección dinámica
 function extract_architecture(model)
     layer_info = []
-    
+
     if isa(model, NeuralNetwork.Sequential)
         for (idx, layer) in enumerate(model.layers)
-            info = Dict{String,Any}("type" => string(typeof(layer)))
-            
-            # Dense layer
+            # Define layer_type para las ramas que lo usan
+            layer_type = string(typeof(layer))
+            info = Dict{String,Any}("type" => layer_type)
+
             if isa(layer, NeuralNetwork.Dense)
                 info["in_features"] = size(layer.weights.data, 2)
                 info["out_features"] = size(layer.weights.data, 1)
                 info["use_bias"] = isdefined(layer, :biases)
-                
-            # Conv2D - inferir parámetros de los pesos
+
             elseif isa(layer, ConvolutionalLayers.Conv2D)
-                # weights shape: (out_channels, in_channels, kernel_h, kernel_w)
                 w_shape = size(layer.weights.data)
                 info["out_channels"] = w_shape[1]
-                info["in_channels"] = w_shape[2]
-                info["kernel_size"] = (w_shape[3], w_shape[4])
-                # Buscar stride y padding si existen como campos
-                info["stride"] = isdefined(layer, :stride) ? layer.stride : (1,1)
+                info["in_channels"]  = w_shape[2]
+                info["kernel_size"]  = (w_shape[3], w_shape[4])
+                info["stride"]  = isdefined(layer, :stride)  ? layer.stride  : (1,1)
                 info["padding"] = isdefined(layer, :padding) ? layer.padding : (0,0)
-                
-            # BatchNorm
+
             elseif isa(layer, Layers.BatchNorm)
                 info["num_features"] = length(layer.gamma.data)
                 info["momentum"] = layer.momentum
@@ -361,10 +358,28 @@ function extract_architecture(model)
                 info["running_mean"] = copy(layer.running_mean)
                 info["running_var"] = copy(layer.running_var)
                 info["num_batches_tracked"] = layer.num_batches_tracked
-                
-            # Dropout
+
             elseif isa(layer, Layers.DropoutLayer)
                 info["rate"] = layer.rate
+
+            # Mantén la compatibilidad con tu lógica previa que usaba 'contains'
+            elseif contains(layer_type, "LSTMCell")
+                info["input_size"]  = layer.input_size
+                info["hidden_size"] = layer.hidden_size
+
+            elseif contains(layer_type, "GRUCell")
+                info["input_size"]  = layer.input_size
+                info["hidden_size"] = layer.hidden_size
+
+            elseif contains(layer_type, "LSTM")
+                info["input_size"]       = layer.cell.input_size
+                info["hidden_size"]      = layer.cell.hidden_size
+                info["return_sequences"] = layer.return_sequences
+
+            elseif contains(layer_type, "GRU")
+                info["input_size"]       = layer.cell.input_size
+                info["hidden_size"]      = layer.cell.hidden_size
+                info["return_sequences"] = layer.return_sequences
 
             elseif isa(layer, Layers.RNNCell)
                 info["input_size"]  = layer.input_size
@@ -373,68 +388,60 @@ function extract_architecture(model)
                 info["activation"]  = string(layer.activation)
 
             elseif isa(layer, Layers.RNN)
-                cell_info = Dict{String,Any}()
-                cell      = layer.cell
-                cell_info["input_size"]  = cell.input_size
-                cell_info["hidden_size"] = cell.hidden_size
-                cell_info["has_bias"]    = (cell.b_ih !== nothing)
-                cell_info["activation"]  = string(cell.activation)
-
-                info["cell_info"]        = cell_info
+                cell = layer.cell
+                info["cell_info"] = Dict(
+                    "input_size"  => cell.input_size,
+                    "hidden_size" => cell.hidden_size,
+                    "has_bias"    => (cell.b_ih !== nothing),
+                    "activation"  => string(cell.activation),
+                )
                 info["batch_first"]      = layer.batch_first
                 info["return_sequences"] = layer.return_sequences
 
-            # Activation - guardar el tipo en lugar del campo fn
             elseif isa(layer, NeuralNetwork.Activation)
-                # Identificar la función por comparación o string
                 info["activation"] = "unknown"
-                # Intentar identificar por el comportamiento o nombre
                 try
-                    # Test con valor conocido para identificar la función
                     test_val = TensorEngine.Tensor([1.0f0, -1.0f0])
                     result = layer(test_val)
-                    
                     if all(result.data .>= 0) && result.data[2] ≈ 0
                         info["activation"] = "relu"
-                    elseif all(0 .< result.data .< 1) && result.data[1] ≈ 0.73
+                    elseif all(0 .< result.data .< 1) && result.data[1] ≈ 0.73f0
                         info["activation"] = "sigmoid"
-                    elseif sum(result.data) ≈ 1.0
+                    elseif sum(result.data) ≈ 1.0f0
                         info["activation"] = "softmax"
                     elseif result.data[2] < 0 && abs(result.data[2]) < 1
                         info["activation"] = "tanh"
                     else
-                        # Guardar representación string del layer
                         info["activation"] = string(layer)
                     end
                 catch
                     info["activation"] = "unknown"
                 end
-                
-            # MaxPooling
+
             elseif isa(layer, ConvolutionalLayers.MaxPooling)
                 info["pool_size"] = layer.pool_size
-                info["stride"] = layer.stride
-                
-            # Embedding
+                info["stride"]    = layer.stride
+
             elseif isa(layer, EmbeddingLayer.Embedding)
                 info["num_embeddings"] = size(layer.weights.data, 1)
-                info["embedding_dim"] = size(layer.weights.data, 2)
-                
-            # Flatten
+                info["embedding_dim"]  = size(layer.weights.data, 2)
+
             elseif isa(layer, Layers.Flatten)
+                # Respeta tu clave anterior para compatibilidad
                 info["layer_type"] = "Flatten"
+
             elseif isa(layer, Layers.LayerNorm)
-                info["num_features"] = layer.normalized_shape  # Tupla completa
+                info["num_features"] = layer.normalized_shape
                 info["eps"] = layer.eps
-                # Guardar parámetros en la estructura
                 info["gamma"] = Array(layer.gamma.data)
-                info["beta"] = Array(layer.beta.data)
+                info["beta"]  = Array(layer.beta.data)
             end
-            
+
+            # Un único push! por iteración
             push!(layer_info, info)
         end
     end
-    
+
     return layer_info
 end
 
@@ -507,6 +514,29 @@ function reconstruct_model(layer_info)
                 info["input_size"],
                 info["hidden_size"];
                 bias = info["has_bias"]
+            )
+
+        elseif contains(layer_type, "LSTMCell")
+            layer = Layers.LSTMCell(
+                info["input_size"],
+                info["hidden_size"]
+            )
+        elseif contains(layer_type, "GRUCell")
+            layer = Layers.GRUCell(
+                info["input_size"],
+                info["hidden_size"]
+            )
+        elseif contains(layer_type, "LSTM")
+            layer = Layers.LSTM(
+                info["input_size"],
+                info["hidden_size"];
+                return_sequences=info["return_sequences"]
+            )
+        elseif contains(layer_type, "GRU")
+            layer = Layers.GRU(
+                info["input_size"],
+                info["hidden_size"];
+                return_sequences=info["return_sequences"]
             )
 
         elseif contains(layer_type, "RNN")

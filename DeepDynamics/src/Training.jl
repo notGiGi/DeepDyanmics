@@ -26,6 +26,7 @@ export train!, train_batch!, compute_accuracy_general, train_improved!,
        train_with_loaders, stack_batch, evaluate_model, 
        fit!, History
 using ..Metrics: accuracy, mae, rmse, binary_accuracy
+using ..Layers
 const optim_step! = Optimizers.step!
 const AnyDataLoader = Union{DataLoader, DataLoaders.OptimizedDataLoader}   
 
@@ -339,8 +340,17 @@ function fit!(model::Sequential,
                 loss.backward_fn(ones(size(loss.data)))
             end
             
-            # Actualizar parámetros
-            optim_step!(optimizer, params)
+            has_rnn = any(layer -> layer isa Union{Layers.RNNCell, Layers.RNN, 
+                                       Layers.LSTMCell, Layers.LSTM,
+                                       Layers.GRUCell, Layers.GRU}, 
+              model.layers)
+
+
+            if has_rnn && optimizer isa Optimizers.Adam
+                optim_step!(optimizer, params; clip_norm=5.0f0)
+            else
+                optim_step!(optimizer, params)
+            end
             
             # Acumular métricas
             epoch_loss_sum += batch_loss
@@ -641,9 +651,18 @@ function fit!(model::Sequential,
             
             # Backward
             backward(loss, [1.0f0])
+
+
+            has_rnn = any(layer -> layer isa Union{Layers.RNNCell, Layers.RNN, 
+                                       Layers.LSTMCell, Layers.LSTM,
+                                       Layers.GRUCell, Layers.GRU}, 
+              model.layers)
             
-            # Update
-            optim_step!(optimizer, params)
+            if has_rnn && optimizer isa Optimizers.Adam
+                optim_step!(optimizer, params; clip_norm=5.0f0)
+            else
+                optim_step!(optimizer, params)
+            end
             
             # Métricas
             for metric in metrics

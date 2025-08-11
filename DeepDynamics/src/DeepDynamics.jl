@@ -138,14 +138,15 @@ using .Visualizations
 using .ReshapeModule: Reshape
 using .Losses: binary_crossentropy, categorical_crossentropy,binary_crossentropy_with_logits
 using .Layers: BatchNorm, set_training!, reset_running_stats!, Flatten,
-               GlobalAvgPool, DropoutLayer, LayerActivation, LayerNorm, RNNCell, RNN
+               GlobalAvgPool, DropoutLayer, LayerActivation, LayerNorm, RNNCell, RNN,
+               LSTMCell, LSTM, GRUCell, GRU
 using .ConvolutionalLayers: Conv2D, MaxPooling, Conv2DTranspose
 using .EmbeddingLayer: Embedding, embedding_forward
 using .NeuralNetwork: Sequential, Dense, Activation, collect_parameters,
                       relu, softmax, sigmoid, tanh_activation, leaky_relu,
                       model_to_gpu, model_to_cpu, model_device, model_to_device,
                       layer_to_device, forward,swish, mish
-using .Optimizers: SGD, Adam, RMSProp, Adagrad, Nadam, step! as optim_step!
+using .Optimizers: SGD, Adam, RMSProp, Adagrad, Nadam, step! as optim_step!, clip_gradients_norm!
 using .Metrics: accuracy, mae, rmse, f1_score, precision, recall, binary_accuracy
 using .Reports
 using .Training: train!, train_batch!, compute_accuracy_general, train_improved!,
@@ -220,7 +221,8 @@ export Tensor, device_of, same_device, gpu_memory_info, ensure_gpu_memory!, zero
        sync_offline_runs, MLOpsConfig, safe_timestamp, ModelBundle, ModelRegistry, register_model, get_model, list_models,
        register_model, get_model, list_models, predict, predict_proba, predict_generator, PredictionPipeline,
        quantize_model, warmup_model, TensorPool, get_tensor_from_pool!,
-       return_to_pool!, LayerNorm,swish, mish, RNNCell, RNN, stack_indices_batch, stack_onehot_batch
+       return_to_pool!, LayerNorm,swish, mish, RNNCell, RNN, stack_indices_batch, stack_onehot_batch,
+       LSTMCell, LSTM, GRUCell, GRU, clip_gradients_norm!
        
 
 end # module
