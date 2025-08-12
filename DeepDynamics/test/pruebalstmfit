@@ -1,0 +1,188 @@
+# test/lstm_fit_example.jl
+using DeepDynamics
+using DeepDynamics.Losses: crossentropy_from_logits
+using CUDA
+using Random
+using Statistics
+using DeepDynamics.Layers
+Random.seed!(42)
+println("=== LSTM con fit! y DataLoaders ===\n")
+
+# ===========================
+# Parámetros
+# ===========================
+num_samples_train = 3000
+num_samples_test  = 600
+seq_len    = 10
+input_dim  = 20
+hidden_lstm = 64
+num_classes = 3
+batch_size  = 64
+
+# ===========================
+# Generación de datos
+# ===========================
+println("📊 Generando datos sintéticos con patrón detectable...")
+
+function generate_sequential_data(n_samples, seq_len, input_dim, num_classes)
+    X = zeros(Float32, input_dim, n_samples, seq_len)
+    Y = zeros(Float32, num_classes, n_samples)
+    
+    for i in axes(X, 2)
+        class = rand(1:num_classes)
+        
+        # Base: ruido gaussiano
+        X[:, i, :] = randn(Float32, input_dim, seq_len) * 0.5f0
+        
+        # Patrón sutil pero detectable por clase
+        for t in axes(X, 3)
+            if class == 1
+                X[1:5, i, t] .+= 0.3f0 * sin(2π * t / seq_len)
+                X[6:10, i, t] .+= 0.2f0 * cos(2π * t / seq_len)
+            elseif class == 2
+                X[6:10, i, t] .+= 0.3f0 * sin(4π * t / seq_len)
+                X[11:15, i, t] .+= 0.2f0 * cos(4π * t / seq_len)
+            else
+                X[11:15, i, t] .+= 0.3f0 * sin(6π * t / seq_len)
+                X[16:20, i, t] .+= 0.2f0 * cos(6π * t / seq_len)
+            end
+            
+            X[:, i, t] .+= randn(Float32, input_dim) * 0.1f0
+        end
+        
+        Y[class, i] = 1f0
+    end
+    
+    return X, Y
+end
+
+# Generar datos
+X_train, y_train = generate_sequential_data(num_samples_train, seq_len, input_dim, num_classes)
+X_test, y_test = generate_sequential_data(num_samples_test, seq_len, input_dim, num_classes)
+
+# Verificación rápida
+println("   Shape X_train: ", size(X_train))  # (20, 3000, 10)
+println("   Shape y_train: ", size(y_train))  # (3, 3000)
+
+# ===========================
+# Preparar DataLoaders
+# ===========================
+println("\n📦 Preparando DataLoaders...")
+
+# Convertir a listas de Tensors (cada muestra individual)
+X_train_list = [Tensor(X_train[:, i:i, :]) for i in axes(X_train, 2)]
+y_train_list = [Tensor(y_train[:, i:i]) for i in axes(y_train, 2)]
+X_test_list = [Tensor(X_test[:, i:i, :]) for i in axes(X_test, 2)]
+y_test_list = [Tensor(y_test[:, i:i]) for i in axes(y_test, 2)]
+
+# Crear DataLoaders
+train_loader = DataLoader(X_train_list, y_train_list, batch_size; shuffle=true)
+val_loader = DataLoader(X_test_list, y_test_list, batch_size; shuffle=false)
+
+println("   Train batches: $(length(train_loader))")
+println("   Val batches: $(length(val_loader))")
+
+# ===========================
+# Modelo LSTM Simple (el ganador)
+# ===========================
+println("\n🏗️ Construyendo modelo LSTM...")
+
+model = Sequential([
+    # LSTM simple que funciona bien
+    LSTM(input_dim, 64; return_sequences=false),
+    DropoutLayer(0.2),
+    
+    # Dense layers
+    Dense(64, 32),
+    Activation(relu),
+    DropoutLayer(0.2),
+    
+    Dense(32, num_classes)  # Logits
+])
+
+# Mover a GPU si está disponible
+if CUDA.functional()
+    model = model_to_gpu(model)
+    println("   🚀 Modelo en GPU")
+else
+    println("   💻 Modelo en CPU")
+end
+
+params = collect_parameters(model)
+total_params = sum(length(p.data) for p in params)
+println("   Parámetros totales: $total_params")
+
+# ===========================
+# Callbacks
+# ===========================
+println("\n⚙️ Configurando callbacks...")
+
+callbacks = [
+    # Early stopping basado en val_loss
+    EarlyStopping(patience=15, monitor="val_loss", min_delta=0.001f0),
+    
+    # Reducir learning rate
+    ReduceLROnPlateau(factor=0.8f0, patience=10, monitor="val_loss"),
+    
+    # Guardar mejor modelo
+    ModelCheckpoint(
+        "best_lstm_model.jld2";
+        monitor="val_loss",
+        mode=:min,
+        save_best_only=true
+    ),
+    
+    # Progreso visual
+    ProgressCallback(1)
+]
+
+# ===========================
+# Entrenar con fit!
+# ===========================
+println("\n📊 Entrenando con fit!...\n")
+
+history = fit!(
+    model, train_loader;
+    val_loader=val_loader,
+    epochs=50,
+    optimizer=Adam(0.001f0),
+    loss_fn=crossentropy_from_logits,
+    callbacks=callbacks,
+    verbose=1,  # 0=silencioso, 1=progreso, 2=detallado
+    log_dir="experiments",
+    experiment_name="lstm_classification",
+    use_tensorboard=false,
+    log_gradients=false
+)
+
+# ===========================
+# Resultados
+# ===========================
+println("\n" * "="^60)
+println("📈 RESULTADOS DEL ENTRENAMIENTO")
+println("="^60)
+
+# Métricas finales
+if isdefined(history, :train_loss) && length(history.train_loss) > 0
+    final_train_loss = history.train_loss[end]
+    best_train_loss = minimum(history.train_loss)
+    println("\n📊 Loss de entrenamiento:")
+    println("   Final: $(round(final_train_loss, digits=4))")
+    println("   Mejor: $(round(best_train_loss, digits=4))")
+end
+
+if isdefined(history, :val_loss) && length(history.val_loss) > 0
+    final_val_loss = history.val_loss[end]
+    best_val_loss = minimum(history.val_loss)
+    best_epoch = argmin(history.val_loss)
+    println("\n📊 Loss de validación:")
+    println("   Final: $(round(final_val_loss, digits=4))")
+    println("   Mejor: $(round(best_val_loss, digits=4)) (época $best_epoch)")
+end
+
+
+
+
+println("\n" * "="^60)
+println("✅ Entrenamiento con fit! completado exitosamente")
+println("="^60)

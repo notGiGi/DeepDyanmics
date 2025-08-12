@@ -33,6 +33,97 @@ const AnyDataLoader = Union{DataLoader, DataLoaders.OptimizedDataLoader}
 using ..Logging: setup_logging
   
 
+# =========================================================
+# RNN Debug Kit – drop-in, sin cambiar APIs
+# =========================================================
+
+
+@inline function _shape_tostr(A)
+    return string(size(A), " | ndims=", ndims(A), " | eltype=", eltype(A))
+end
+
+@inline function _dims_equal(a,b)  # evita alocaciones de == para tuples
+    return length(a)==length(b) && all(a[i]==b[i] for i in eachindex(a))
+end
+
+"""
+    _debug_rnn_normalize!(x::Tensor, first, where::String, batch_idx::Int)
+
+Imprime diagnóstico detallado del primer batch y sugiere/corrige a (C,B,T).
+Retorna `x` (posiblemente normalizado).
+"""
+const DEBUG_RNN = false  # cámbialo a true cuando quieras logs
+
+function _debug_rnn_normalize!(x::TensorEngine.Tensor, first, where::AbstractString, batch_idx::Int)
+    A = x.data; req = x.requires_grad
+    has_rnn = (first isa Layers.LSTM) || (first isa Layers.GRU) ||
+              (hasproperty(first,:cell) && hasproperty(first.cell,:input_size))
+    if !has_rnn
+        return x
+    end
+    input_size = hasproperty(first,:cell) ? first.cell.input_size : nothing
+    log_this = DEBUG_RNN && batch_idx == 1
+
+    if log_this
+        println("\n── RNN DEBUG [$where / batch=$batch_idx] ─────────────────────────────")
+        println("first layer   : ", typeof(first))
+        println("input_size    : ", input_size)
+        println("x pre         : ", (size(A), " | ndims=", ndims(A), " | eltype=", eltype(A)))
+    end
+
+    # 1) exprime dims==1 si hay 4D+
+    if ndims(A) >= 4
+        drop = Tuple(i for (i,s) in enumerate(size(A)) if s == 1)
+        if !isempty(drop)
+            A = dropdims(A; dims=drop)
+            if log_this
+                println("dropdims→3D  : ", (size(A), " | ndims=", ndims(A)), " (dims quitadas=", drop, ")")
+            end
+        end
+    end
+
+    # 2) Normaliza a (C=input, B, T)
+    if ndims(A) == 3 && input_size !== nothing
+        d1,d2,d3 = size(A)
+        if log_this
+            println("3D candidate  : ", (d1,d2,d3), "  (queremos (C=input,B,T))")
+        end
+        if d1 == input_size
+            # ya está ok
+        elseif d2 == input_size
+            A = permutedims(A,(2,1,3))   # (B,C,T) -> (C,B,T)
+            if log_this; println("perm OK       : (2,1,3) → ", size(A)); end
+        elseif d3 == input_size
+            A = permutedims(A,(3,2,1))   # (T,B,C) -> (C,B,T)
+            if log_this; println("perm OK       : (3,2,1) → ", size(A)); end
+        end
+        if log_this && d3 >= 1
+            println("slice x[:, :, 1] → ", size(@view A[:, :, 1]), " (esperado (", input_size, ", batch))")
+            println("✅ NORMALIZADO : ", size(A), "  (C,B,T)")
+            println("────────────────────────────────────────────────────────────\n")
+        end
+        return TensorEngine.Tensor(A; requires_grad=req)
+
+    elseif ndims(A) == 2 && input_size !== nothing
+        d1,d2 = size(A)
+        if d1 == input_size
+            A2 = reshape(A, d1, d2, 1)
+            if log_this; println("reshape OK    : ", size(A2)); end
+            return TensorEngine.Tensor(A2; requires_grad=req)
+        elseif d2 == input_size
+            A2 = reshape(permutedims(A,(2,1)), input_size, d1, 1)
+            if log_this; println("perm+reshape  : ", size(A2)); end
+            return TensorEngine.Tensor(A2; requires_grad=req)
+        else
+            return x
+        end
+    else
+        return x
+    end
+end
+
+
+
 # -----------------------------------------------------------------------
 # Estructuras de EarlyStopping, Callbacks, etc.
 # -----------------------------------------------------------------------
@@ -136,6 +227,60 @@ function ensure_tensor_on_device(tensor::Tensor, device::Symbol)
     end
     return tensor
 end
+
+
+# --- Helpers de normalización (sin cambiar APIs) ---
+@inline function _force_CBT3D(x::TensorEngine.Tensor, input_size::Int)
+    A = x.data; req = x.requires_grad
+
+    # 1) Exprime TODAS las dims == 1 hasta dejar <=3 dims
+    if ndims(A) >= 4
+        A = dropdims(A; dims=Tuple(i for (i,s) in enumerate(size(A)) if s == 1))
+    end
+
+    nd = ndims(A)
+    if nd == 3
+        d1,d2,d3 = size(A)
+        if d1 == input_size
+            return TensorEngine.Tensor(A; requires_grad=req)                   # (C,B,T) OK
+        elseif d2 == input_size
+            return TensorEngine.Tensor(permutedims(A,(2,1,3)); requires_grad=req) # (B,C,T)->(C,B,T)
+        elseif d3 == input_size
+            return TensorEngine.Tensor(permutedims(A,(3,2,1)); requires_grad=req) # (T,B,C)->(C,B,T)
+        else
+            # si nada coincide, mejor no tocar
+            return TensorEngine.Tensor(A; requires_grad=req)
+        end
+    elseif nd == 2
+        d1,d2 = size(A)
+        if d1 == input_size
+            return TensorEngine.Tensor(reshape(A, d1, d2, 1); requires_grad=req)  # (C,B)->(C,B,1)
+        elseif d2 == input_size
+            A2 = permutedims(A,(2,1))                                             # (B,C)->(C,B,1)
+            return TensorEngine.Tensor(reshape(A2, input_size, size(A2,2), 1); requires_grad=req)
+        else
+            return TensorEngine.Tensor(A; requires_grad=req)
+        end
+    else
+        return x
+    end
+end
+
+
+@inline function _normalize_label_batch(y::TensorEngine.Tensor)
+    A = y.data; req = y.requires_grad
+    nd = ndims(A)
+    if nd >= 3
+        # Expríme dims singleton (p.ej. (K,B,1) -> (K,B))
+        drop = Tuple(i for (i,s) in enumerate(size(A)) if s == 1)
+        if !isempty(drop)
+            A = dropdims(A; dims=drop)
+        end
+    end
+    return TensorEngine.Tensor(A; requires_grad=req)
+end
+# --- fin helpers ---
+
 
 
 # Historia para almacenar métricas
@@ -323,7 +468,26 @@ function fit!(model::Sequential,
             for param in params
                 zero_grad!(param)
             end
-            
+            first = model.layers[1]
+
+            # Normaliza si es recurrente (tipos calificados)
+            if first isa Layers.LSTM
+                input_batch = _force_CBT3D(input_batch, first.cell.input_size)
+            elseif first isa Layers.GRU
+                input_batch = _force_CBT3D(input_batch, first.cell.input_size)
+
+            # Fallback genérico: cualquier capa con .cell.input_size
+            elseif hasproperty(first, :cell) && hasproperty(first.cell, :input_size)
+                input_batch = _force_CBT3D(input_batch, first.cell.input_size)
+            end
+
+            # Etiquetas: exprime dims fantasma
+            target_batch = _normalize_label_batch(target_batch)
+            first = model.layers[1]
+            # debug + normalización solo en batch 1
+            input_batch  = _debug_rnn_normalize!(input_batch, first, "train:anyloader", batch_idx)
+            target_batch = _normalize_label_batch(target_batch)  # exprime (K,B,1)
+
             # Forward pass
             output = forward(model, input_batch)
             
@@ -637,11 +801,35 @@ function fit!(model::Sequential,
                 zero_grad!(p)
             end
             
+             
             # Stack batch
-            device = model_device(model)
+            device  = model_device(model)
             X_batch = stack_batch([ensure_tensor_on_device(x, device) for x in batch_X])
             y_batch = stack_batch([ensure_tensor_on_device(y, device) for y in batch_y])
-            
+
+            first = model.layers[1]
+
+            # Normaliza si es recurrente (tipos calificados o fallback con .cell.input_size)
+            if first isa Layers.LSTM
+                X_batch = _force_CBT3D(X_batch, first.cell.input_size)
+            elseif first isa Layers.GRU
+                X_batch = _force_CBT3D(X_batch, first.cell.input_size)
+            elseif hasproperty(first, :cell) && hasproperty(first.cell, :input_size)
+                X_batch = _force_CBT3D(X_batch, first.cell.input_size)
+            end
+
+            # Expríme dims fantasma en etiquetas (p. ej., (K,B,1) -> (K,B))
+            y_batch = _normalize_label_batch(y_batch)
+
+            # Salvavidas: si quedara alguna dim = 1 colada en X_batch, exprímela
+            if ndims(X_batch.data) >= 4
+                X_batch = Tensor(dropdims(X_batch.data; 
+                        dims=Tuple(i for (i,s) in enumerate(size(X_batch.data)) if s == 1));
+                        requires_grad=X_batch.requires_grad)
+            end
+            first   = model.layers[1]
+            X_batch = _debug_rnn_normalize!(X_batch, first, "train:vector", batch_idx)
+            y_batch = _normalize_label_batch(y_batch)
             # Forward
             y_pred = forward(model, X_batch)
             
@@ -796,44 +984,86 @@ end
 
 
 
-# Función auxiliar para procesar input batches
+# Función auxiliar para procesar input batches (versión robusta, drop-in)
 function process_batch_input(batch_x, model)
+    # --- inferencia mínima del tamaño de entrada y tipo de primera capa ---
+    function _infer_input_size_and_kind(model)
+        first_layer = model.layers[1]
+        if first_layer isa LSTM
+            return first_layer.cell.input_size, :recurrent
+        elseif first_layer isa GRU
+            return first_layer.cell.input_size, :recurrent
+        elseif first_layer isa Dense
+            return size(first_layer.weights.data, 2), :dense
+        else
+            return nothing, :other
+        end
+    end
+    input_size, kind = _infer_input_size_and_kind(model)
+
     if isa(batch_x, Vector{<:TensorEngine.Tensor})
         # DataLoader normal: stack de vectores
-        return stack_batch(batch_x)
+        t = stack_batch(batch_x)
+
+        # Normalizar si es secuencia 3D y la primera capa es recurrente
+        if kind == :recurrent && ndims(t.data) == 3
+            X = t.data
+            C, B, T = size(X)  # esperado (input_dim, batch, seq_len)
+            # Caso común de error: llega (B, C, T) → permutar a (C, B, T)
+            if C != input_size && B == input_size
+                Xn = permutedims(X, (2, 1, 3))
+                return TensorEngine.Tensor(Xn; requires_grad=t.requires_grad)
+            end
+        end
+        return t
+
     elseif isa(batch_x, TensorEngine.Tensor)
         # OptimizedDataLoader: ya es un tensor
         data = batch_x.data
-        
-        # Verificar si las dimensiones son correctas
-        if ndims(data) == 1
-            # Está aplanado, necesitamos reconstruir
-            # Obtener el tamaño de entrada esperado de la primera capa
+        nd = ndims(data)
+
+        if nd == 1
+            # Igual que tu lógica original (para primera capa Dense)
             first_layer = model.layers[1]
             if isa(first_layer, Dense)
                 input_dim = size(first_layer.weights.data, 2)
                 batch_size = div(length(data), input_dim)
-                
                 if length(data) != input_dim * batch_size
                     error("Datos mal formateados: $(length(data)) elementos no divisibles por input_dim=$input_dim")
                 end
-                
-                # Reshape a (input_dim, batch_size)
                 reshaped = reshape(data, input_dim, batch_size)
                 return TensorEngine.Tensor(reshaped)
             else
                 error("Primera capa no es Dense, no se puede inferir dimensiones")
             end
-        elseif ndims(data) == 2
-            # Ya tiene forma correcta
+
+        elseif nd == 2
+            # Ya tiene forma correcta (input_dim, batch)
             return batch_x
+
+        elseif nd == 3
+            # NUEVO: soportar entradas 3D para capas recurrentes
+            if kind == :recurrent
+                X = data
+                C, B, T = size(X)  # queremos (input_dim, batch, seq_len)
+                if C != input_size && B == input_size
+                    Xn = permutedims(X, (2, 1, 3))  # (B,C,T) -> (C,B,T)
+                    return TensorEngine.Tensor(Xn; requires_grad=batch_x.requires_grad)
+                else
+                    return batch_x
+                end
+            else
+                error("Dimensión 3D inesperada para primera capa $kind")
+            end
+
         else
-            error("Dimensiones inesperadas en batch_x: $(ndims(data))D")
+            error("Dimensiones inesperadas en batch_x: $(nd)D")
         end
     else
         error("Tipo de batch no soportado: $(typeof(batch_x))")
     end
 end
+
 
 # Función auxiliar para procesar target batches
 function process_batch_target(batch_y, input_batch, loss_fn)
@@ -899,7 +1129,10 @@ function evaluate_loader(model, loss_fn, data_loader::AnyDataLoader, device::Sym
                 target_batch = to_cpu(target_batch)
             end
         end
-        
+        first       = model.layers[1]
+        input_batch = _debug_rnn_normalize!(input_batch, first, "eval", 1)  # usa 1, es suficiente
+        target_batch = _normalize_label_batch(target_batch)
+
         # Forward pass sin gradientes
         output = forward(model, input_batch)
         loss = loss_fn(output, target_batch)

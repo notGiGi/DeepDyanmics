@@ -1,0 +1,24 @@
+{
+  "hardware_info": {
+    "cpu_model": "12th Gen Intel(R) Core(TM) i5-12450H",
+    "cuda_version": "12.6.0",
+    "gpu_available": true,
+    "system_memory_gb": 8.27961344,
+    "gpu_name": "NVIDIA GeForce RTX 3050 Laptop GPU",
+    "gpu_memory_total": 4.294443008,
+    "cpu_threads": 1
+  },
+  "optimizer": "Adam",
+  "batch_size": 64,
+  "learning_rate": 0.001,
+  "epochs": 50,
+  "start_time": "2025-08-11T18:03:08.180",
+  "git_info": {
+    "commit": "a04ce28a3ef4c4af40b64ebc57caab66f1f67305",
+    "available": "false"
+  },
+  "julia_version": "1.11.6",
+  "model_type": "Sequential",
+  "loss_fn": "categorical_crossentropy_from_logits",
+  "experiment_id": "20250811_180307_50984"
+}
